@@ -193,10 +193,10 @@ function inferType(typeStr: string, ticker: string): 'stock' | 'etf' | 'mutual_f
   return 'stock';
 }
 
-function inferBucket(bucketStr: string, ticker?: string): 'cash' | 'income' | 'growth' | 'unassigned' {
+function inferBucket(bucketStr: string, ticker?: string): 'cash' | 'bridge' | 'growth' | 'unassigned' {
   const lower = bucketStr.toLowerCase();
   if (lower.includes('cash') || lower === '1') return 'cash';
-  if (lower.includes('income') || lower.includes('bond') || lower === '2') return 'income';
+  if (lower.includes('bridge') || lower.includes('income') || lower.includes('bond') || lower === '2') return 'bridge';
   if (lower.includes('growth') || lower.includes('equity') || lower === '3') return 'growth';
   
   if (ticker) {
@@ -205,7 +205,7 @@ function inferBucket(bucketStr: string, ticker?: string): 'cash' | 'income' | 'g
   return 'unassigned';
 }
 
-function inferBucketFromTicker(ticker: string): 'cash' | 'income' | 'growth' | 'unassigned' {
+function inferBucketFromTicker(ticker: string): 'cash' | 'bridge' | 'growth' | 'unassigned' {
   const t = ticker.toUpperCase();
   
   const cashFunds = [
@@ -219,13 +219,13 @@ function inferBucketFromTicker(ticker: string): 'cash' | 'income' | 'growth' | '
     'BOND', 'GOVT', 'LQD', 'HYG', 'JNK', 'MUB', 'TLT', 'IEF', 'SHY',
     'VCIT', 'VCSH', 'BSV', 'BIV', 'BLV', 'VAIPX', 'VBMFX', 'FBNDX'
   ];
-  if (bondFunds.some(b => t.includes(b))) return 'income';
+  if (bondFunds.some(b => t.includes(b))) return 'bridge';
   
-  const incomeFunds = [
+  const bridgeFunds = [
     'SCHD', 'VIG', 'VYM', 'DVY', 'SDY', 'HDV', 'DGRO', 'NOBL',
     'SPYD', 'SPHD', 'VDIGX', 'VHDYX', 'DIV', 'DIVD'
   ];
-  if (incomeFunds.some(i => t.includes(i))) return 'income';
+  if (bridgeFunds.some(i => t.includes(i))) return 'bridge';
   
   const growthFunds = [
     'VOO', 'VTI', 'SPY', 'IVV', 'QQQ', 'VGT', 'SCHG', 'VUG', 'IWF',

@@ -62,10 +62,10 @@ function EditableCell({
           className="h-7 w-24 text-right font-mono text-sm"
           autoFocus
         />
-        <Button variant="ghost" size="icon" onClick={handleSave} className="h-6 w-6 text-green-600">
+        <Button variant="ghost" size="icon" onClick={handleSave} className="h-6 w-6 text-primary">
           <Check size={12} />
         </Button>
-        <Button variant="ghost" size="icon" onClick={handleCancel} className="h-6 w-6 text-red-500">
+        <Button variant="ghost" size="icon" onClick={handleCancel} className="h-6 w-6 text-destructive">
           <X size={12} />
         </Button>
       </div>
@@ -208,18 +208,21 @@ export function HoldingsTable() {
         return;
       }
       
+      const nonTradeableTickers = ['INVESC', 'BNYMEL', 'PIMCOV', 'PIMCOVIT', 'MFIS', 'MFRS', 'FGTXX', 'DEPOSIT', 'CASH'];
       let imported = 0;
       for (const h of pdfHoldings) {
         if (h.ticker && h.shares > 0) {
+          const normalizedBucket = h.bucket === 'income' ? 'bridge' : (h.bucket || 'unassigned');
+          const isNonTradeable = nonTradeableTickers.includes(h.ticker.toUpperCase()) || h.ticker.includes('.');
           await addHolding({
             ticker: h.ticker,
             name: h.name || h.ticker,
             type: inferTypeFromTicker(h.ticker),
             quantity: h.shares,
             accountId: defaultAccountId,
-            bucket: h.bucket as any || 'unassigned',
+            bucket: normalizedBucket as any,
             currentPrice: h.price,
-            isManualPrice: true
+            isManualPrice: isNonTradeable
           });
           imported++;
         }
@@ -257,7 +260,7 @@ export function HoldingsTable() {
 
   const bucketColors: Record<BucketType, string> = {
     cash: 'bg-chart-3/20 text-chart-3 border-chart-3/30',
-    income: 'bg-chart-2/20 text-chart-2-foreground border-chart-2/30',
+    bridge: 'bg-chart-2/20 text-chart-2-foreground border-chart-2/30',
     growth: 'bg-chart-1/20 text-chart-1 border-chart-1/30',
     unassigned: 'bg-muted text-muted-foreground border-border',
   };
@@ -372,7 +375,7 @@ export function HoldingsTable() {
                         onChange={(e) => setBucket(holding.id, e.target.value as BucketType)}
                     >
                         <option value="cash">Cash</option>
-                        <option value="income">Income</option>
+                        <option value="bridge">Bridge</option>
                         <option value="growth">Growth</option>
                         <option value="unassigned">—</option>
                     </select>

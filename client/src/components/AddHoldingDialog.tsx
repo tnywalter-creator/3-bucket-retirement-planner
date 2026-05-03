@@ -27,7 +27,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 const holdingSchema = z.object({
   ticker: z.string().min(1, "Ticker is required"),
   quantity: z.string().transform(val => Number(val)).pipe(z.number().positive("Quantity must be positive")),
-  bucket: z.enum(['cash', 'income', 'growth', 'unassigned']),
+  bucket: z.enum(['cash', 'bridge', 'growth', 'unassigned']),
   accountId: z.string().min(1, "Account is required"),
   type: z.enum(['stock', 'etf', 'mutual_fund', 'bond', 'cash']),
 });
@@ -147,9 +147,9 @@ export function AddHoldingDialog() {
                       </SelectTrigger>
                     </FormControl>
                     <SelectContent>
-                      <SelectItem value="cash">Bucket 1: Cash</SelectItem>
-                      <SelectItem value="income">Bucket 2: Income</SelectItem>
-                      <SelectItem value="growth">Bucket 3: Growth</SelectItem>
+                      <SelectItem value="cash">B1: Cash Reserve</SelectItem>
+                      <SelectItem value="bridge">B2: Bridge</SelectItem>
+                      <SelectItem value="growth">B3: Growth</SelectItem>
                       <SelectItem value="unassigned">Unassigned</SelectItem>
                     </SelectContent>
                   </Select>

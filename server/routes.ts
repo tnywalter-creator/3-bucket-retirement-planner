@@ -110,95 +110,187 @@ function parsePDFText(text: string): Array<{ticker: string, name: string, shares
   const holdings: Array<{ticker: string, name: string, shares: number, price: number, value: number, bucket: string}> = [];
   const seen = new Set<string>();
   
-  // Clean up timestamp/page break noise from the text
   let cleanText = text.replace(/\d+\/\d+\/\d+,\s+\d+:\d+\s+(AM|PM)\s+Empower\s+-\s+Portfolio\s+https?:\/\/[^\s]+\s+\d+\/\d+/gi, ' ');
   cleanText = cleanText.replace(/Privacy\s+Terms of Service.*?All Rights Reserved\./gi, ' ');
   
-  const skipTickers = ['NONE', 'FROM', 'ETF', 'SHARES', 'FUND', 'INDEX', 'TRUST', 'DAY', 'HOLDINGS', 'AM', 'HTTPS', 'HTTP', 'TERMS', 'HELP', 'FAQ', 'VI', 'VIT', 'PIMCO', 'BNY', 'MELLON'];
+  // Detect format by checking for header. New format has "1 day $", old has "1 Day %"
+  const newFormatHeader = cleanText.match(/Holding\s+Shares\s+Price\s+Change\s+1\s*day\s+\$/i);
+  const oldFormatHeader = cleanText.match(/Holding\s+Shares\s+Price\s+Change\s+1\s*Day\s*%/i);
   
-  // Pattern 1: Standard format with +/- percentage
-  // Example: "GCO  Genesco Inc  2431   $27.22   $0.63   +2.37%   +$1,531.53   $66,171.82"
-  const standardPattern = /\b([A-Z]{2,6}(?:\.[A-Z]{1,2})?)\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/g;
+  const headerMatch = newFormatHeader || oldFormatHeader;
+  if (headerMatch && headerMatch.index !== undefined) {
+    cleanText = cleanText.substring(headerMatch.index + headerMatch[0].length);
+  }
   
+  // Trim at Grand Total
+  const grandTotalIdx = cleanText.search(/Grand\s+Total/i);
+  if (grandTotalIdx !== -1) {
+    cleanText = cleanText.substring(0, grandTotalIdx);
+  }
+
+  const isNewFormat = !!newFormatHeader;
+  
+  const skipTickers = ['NONE', 'FROM', 'ETF', 'SHARES', 'FUND', 'INDEX', 'TRUST', 'DAY', 'HOLDINGS', 'AM', 'HTTPS', 'HTTP', 'TERMS', 'HELP', 'FAQ', 'VI', 'VIT', 'PIMCO', 'BNY', 'MELLON', 'NET', 'WORTH', 'GRAND', 'TOTAL', 'SEARCH'];
+
+  function addHolding(ticker: string, name: string, shares: number, price: number, value: number, bucket: string) {
+    const key = `${ticker}-${shares.toFixed(2)}`;
+    if (!seen.has(key) && shares > 0 && price > 0) {
+      seen.add(key);
+      holdings.push({ ticker, name: name || ticker, shares, price, value: value || shares * price, bucket });
+    }
+  }
+
   let match;
-  while ((match = standardPattern.exec(cleanText)) !== null) {
-    const ticker = match[1];
-    const shares = parseFloat(match[2].replace(/,/g, ''));
-    const price = parseFloat(match[3].replace(/,/g, ''));
-    const value = parseFloat(match[4].replace(/,/g, ''));
-    
-    if (skipTickers.includes(ticker) || shares === 0) continue;
-    
-    const key = `${ticker}-${shares.toFixed(2)}`;
-    if (!seen.has(key) && shares > 0 && value > 0) {
-      seen.add(key);
-      holdings.push({ ticker, name: ticker, shares, price, value, bucket: inferBucketFromTicker(ticker) });
+
+  if (isNewFormat) {
+    // =========================================================
+    // NEW FORMAT: Holding | Shares | Price | Change | 1 day $ | Value
+    // Row format in extracted text (name is inline after ticker):
+    //   "TICKER  Name of Holding  shares  $price  $change  +$1dayDollar  $value"
+    // =========================================================
+
+    // Fix stray split numbers like "3  ,315" that appear from chart overlays
+    cleanText = cleanText.replace(/(\d)\s+,(\d{3})\b/g, '$1,$2');
+
+    // Pattern N1: PIMCO VIT multi-word ticker (no inline name, just numbers follow)
+    const pimcoNew = /PIMCO\s+VIT\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = pimcoNew.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const price = parseFloat(match[2].replace(/,/g, ''));
+      const value = parseFloat(match[3].replace(/,/g, ''));
+      addHolding('PIMCOVIT', 'PIMCO VIT', shares, price, value, 'bridge');
     }
-  }
-  
-  // Pattern 2: Zero change format (0.00% $0.00)
-  // Example: "BTC  Bitcoin  4984   $40.66   $0.00   0.00%   $0.00   $202,624.52"
-  const zeroChangePattern = /\b([A-Z]{2,6}(?:\.[A-Z]{1,2})?)\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+\$0\.00\s+0\.00%\s+\$0\.00\s+\$([\d,]+\.?\d*)/g;
-  
-  while ((match = zeroChangePattern.exec(cleanText)) !== null) {
-    const ticker = match[1];
-    const shares = parseFloat(match[2].replace(/,/g, ''));
-    const price = parseFloat(match[3].replace(/,/g, ''));
-    const value = parseFloat(match[4].replace(/,/g, ''));
-    
-    if (skipTickers.includes(ticker) || shares === 0) continue;
-    
-    const key = `${ticker}-${shares.toFixed(2)}`;
-    if (!seen.has(key) && shares > 0 && value > 0) {
-      seen.add(key);
-      holdings.push({ ticker, name: ticker, shares, price, value, bucket: inferBucketFromTicker(ticker) });
+
+    // Pattern N2: Cash row (no inline name)
+    const cashNew = /\bCash\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = cashNew.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const value = parseFloat(match[2].replace(/,/g, ''));
+      addHolding('CASH', 'Cash', shares, 1.00, value, 'cash');
     }
-  }
-  
-  // Pattern 3: Multi-word proprietary funds (INVESCO VI, PIMCO VIT, BNY MELLON)
-  // Example: "INVESCO VI   3565.13   $61.17   $0.00   0.00%   $0.00   $218,079.00"
-  const proprietaryPattern = /(INVESCO VI|PIMCO VIT|BNY MELLON)\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
-  
-  while ((match = proprietaryPattern.exec(cleanText)) !== null) {
-    const name = match[1].toUpperCase();
-    const shares = parseFloat(match[2].replace(/,/g, ''));
-    const price = parseFloat(match[3].replace(/,/g, ''));
-    const value = parseFloat(match[4].replace(/,/g, ''));
-    const ticker = name.replace(/\s+/g, '').substring(0, 6);
-    
-    const key = `${ticker}-${shares.toFixed(2)}`;
-    if (!seen.has(key) && shares > 0 && value > 0) {
-      seen.add(key);
-      // PIMCO VIT is a bond fund
-      const bucket = name.includes('PIMCO') ? 'income' : 'growth';
-      holdings.push({ ticker, name, shares, price, value, bucket });
+
+    // Pattern N3: Insured Bank Deposit row (no inline name)
+    const depositNew = /Insured Bank Deposit\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = depositNew.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const value = parseFloat(match[2].replace(/,/g, ''));
+      addHolding('DEPOSIT', 'Insured Bank Deposit', shares, 1.00, value, 'cash');
     }
-  }
-  
-  // Pattern 4: Cash entry
-  // Example: "Cash   171091.7   $1.00   $0.00   0.00%   $0.00   $171,091.69"
-  const cashPattern = /\bCash\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
-  
-  while ((match = cashPattern.exec(cleanText)) !== null) {
-    const shares = parseFloat(match[1].replace(/,/g, ''));
-    const value = parseFloat(match[2].replace(/,/g, ''));
-    
-    const key = `CASH-${shares.toFixed(2)}`;
-    if (!seen.has(key) && shares > 0 && value > 0) {
-      seen.add(key);
-      holdings.push({ ticker: 'CASH', name: 'Cash', shares, price: 1.00, value, bucket: 'cash' });
+
+    // Pattern N4: Standard ticker WITH inline name between ticker and numbers
+    // e.g. "VOO  Vanguard S&P 500 ETF  1085  $652.78  $7.92  +$8,593.22  $708,267.67"
+    // e.g. "IBIT  INTERBIT LTD ISIN CA45845F1009...  318  $43.93  $0.00  $0.00  $13,969.74"
+    // The name is any non-newline, non-$ text between ticker and shares.
+    const stdNew = /\b([A-Z]{2,6})\s+(?:[^\n$]*?\s+)?([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/g;
+    while ((match = stdNew.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const value = parseFloat(match[4].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, value, inferBucketFromTicker(ticker));
     }
-  }
-  
-  // Pattern 5: Insured Bank Deposit
-  const depositPattern = /Insured Bank Deposit\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
-  
-  while ((match = depositPattern.exec(cleanText)) !== null) {
-    const shares = parseFloat(match[1].replace(/,/g, ''));
-    const value = parseFloat(match[2].replace(/,/g, ''));
-    
-    if (shares > 0 && value > 0) {
-      holdings.push({ ticker: 'DEPOSIT', name: 'Insured Bank Deposit', shares, price: 1.00, value, bucket: 'cash' });
+
+  } else {
+    // =========================================================
+    // OLD FORMAT: Holding | Shares | Price | Change | 1 Day % | 1 Day $ | Value
+    // =========================================================
+
+    // Pattern 1a: Standard format WITH total value column
+    // Example: "GCO  Genesco Inc  2431   $27.22   $0.63   +2.37%   +$1,531.53   $66,171.82"
+    const standardWithValue = /\b([A-Z]{2,6}(?:\.[A-Z]{1,2})?)\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/g;
+    while ((match = standardWithValue.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const value = parseFloat(match[4].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, value, inferBucketFromTicker(ticker));
+    }
+
+    // Pattern 1b: Standard format WITHOUT total value column
+    const standardNoValue = /\b([A-Z]{2,6}(?:\.[A-Z]{1,3})?)\b\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,.]+\s+[+-]?[\d,.]+%\s+[+-]?\$[\d,]+/g;
+    while ((match = standardNoValue.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, shares * price, inferBucketFromTicker(ticker));
+    }
+
+    // Pattern 2a: Zero change WITH total value
+    const zeroWithValue = /\b([A-Z]{2,6}(?:\.[A-Z]{1,3})?)\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+\$0\.00\s+0\.00%\s+\$0(?:\.00)?\s+\$([\d,]+\.?\d*)/g;
+    while ((match = zeroWithValue.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const value = parseFloat(match[4].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, value, inferBucketFromTicker(ticker));
+    }
+
+    // Pattern 2b: Zero change WITHOUT total value
+    const zeroNoValue = /\b([A-Z]{2,6}(?:\.[A-Z]{1,3})?)\b\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+\$0\.00\s+0\.00%\s+\$0\b/g;
+    while ((match = zeroNoValue.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, shares * price, inferBucketFromTicker(ticker));
+    }
+
+    // Pattern 3a: Multi-word proprietary funds WITH total value
+    const proprietaryWithValue = /(INVESCO VI|PIMCO VIT|BNY MELLON)\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = proprietaryWithValue.exec(cleanText)) !== null) {
+      const name = match[1].toUpperCase();
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const value = parseFloat(match[4].replace(/,/g, ''));
+      const ticker = name.replace(/\s+/g, '').substring(0, 6);
+      addHolding(ticker, name, shares, price, value, name.includes('PIMCO') ? 'bridge' : 'growth');
+    }
+
+    // Pattern 3b: Multi-word proprietary funds WITHOUT total value
+    const proprietaryNoValue = /(INVESCO VI|PIMCO VIT|BNY MELLON)\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,]+/gi;
+    while ((match = proprietaryNoValue.exec(cleanText)) !== null) {
+      const name = match[1].toUpperCase();
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const ticker = name.replace(/\s+/g, '').substring(0, 6);
+      addHolding(ticker, name, shares, price, shares * price, name.includes('PIMCO') ? 'bridge' : 'growth');
+    }
+
+    // Pattern 4a: Cash WITH total value
+    const cashWithValue = /\bCash\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = cashWithValue.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const value = parseFloat(match[2].replace(/,/g, ''));
+      addHolding('CASH', 'Cash', shares, 1.00, value, 'cash');
+    }
+
+    // Pattern 4b: Cash WITHOUT total value
+    const cashNoValue = /\bCash\s+([\d,]+\.?\d*)\s+\$1\.00\s+\$0\.00\s+0\.00%\s+\$0\b/gi;
+    while ((match = cashNoValue.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      addHolding('CASH', 'Cash', shares, 1.00, shares, 'cash');
+    }
+
+    // Pattern 5: Insured Bank Deposit
+    const depositPattern = /Insured Bank Deposit\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+(?:\s+\$([\d,]+\.?\d*))?/gi;
+    while ((match = depositPattern.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const value = match[2] ? parseFloat(match[2].replace(/,/g, '')) : shares;
+      if (shares > 0) addHolding('DEPOSIT', 'Insured Bank Deposit', shares, 1.00, value, 'cash');
+    }
+
+    // Pattern 6: Bond tickers with dot (e.g. ORCL.GP)
+    const bondPattern = /\b([A-Z]{2,6}\.[A-Z]{1,3})\s+(?:[^$\d]*?\s+)?([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%/g;
+    while ((match = bondPattern.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      if (shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, shares * price, 'bridge');
     }
   }
   
@@ -212,10 +304,10 @@ function inferBucketFromTicker(ticker: string): string {
   if (cashFunds.some(c => t.includes(c)) || t === 'CASH' || t.includes('MONEY') || t.includes('DEPOSIT')) return 'cash';
   
   const bondFunds = ['BND', 'AGG', 'TIP', 'TIPS', 'VTIP', 'SCHZ', 'IUSB', 'VBTLX', 'BOND', 'GOVT', 'LQD', 'HYG', 'JNK', 'MUB', 'TLT', 'IEF', 'SHY', 'VCIT', 'VCSH', 'BSV', 'BIV', 'BLV', 'VAIPX', 'VBMFX', 'FBNDX', 'VGIT', 'IGIB', 'USHY', 'LBNOX', 'JCBUX', 'VWOB', 'PIMCO'];
-  if (bondFunds.some(b => t.includes(b))) return 'income';
+  if (bondFunds.some(b => t.includes(b))) return 'bridge';
   
-  const incomeFunds = ['SCHD', 'VIG', 'VYM', 'DVY', 'SDY', 'HDV', 'DGRO', 'NOBL', 'SPYD', 'SPHD', 'VDIGX', 'VHDYX'];
-  if (incomeFunds.some(i => t.includes(i))) return 'income';
+  const bridgeFunds = ['SCHD', 'VIG', 'VYM', 'DVY', 'SDY', 'HDV', 'DGRO', 'NOBL', 'SPYD', 'SPHD', 'VDIGX', 'VHDYX'];
+  if (bridgeFunds.some(i => t.includes(i))) return 'bridge';
   
   return 'growth';
 }

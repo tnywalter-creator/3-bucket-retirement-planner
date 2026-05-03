@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'wouter';
-import { LayoutDashboard, Wallet, PieChart, TrendingUp, Settings } from 'lucide-react';
+import { LayoutDashboard, Wallet, PieChart, TrendingUp, Settings, FileText } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export function Layout({ children }: { children: React.ReactNode }) {
@@ -12,7 +12,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
     { href: '/buckets', label: 'Buckets', icon: PieChart },
     { href: '/projection', label: 'Plan', icon: TrendingUp },
     { href: '/scenarios', label: 'Settings', icon: Settings },
-  ];
+    { href: '/report', label: 'Report', icon: FileText, desktopOnly: true },
+  ] as const;
 
   return (
     <div className="min-h-screen bg-background flex font-sans text-foreground">
@@ -67,7 +68,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
       {/* Mobile Bottom Navigation */}
       <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-background/95 backdrop-blur border-t border-border z-50 pb-safe">
         <div className="flex justify-around items-center h-16 px-2">
-          {navItems.map((item) => {
+          {navItems.filter(item => !('desktopOnly' in item && item.desktopOnly)).map((item) => {
             const isActive = location === item.href;
             const Icon = item.icon;
             return (

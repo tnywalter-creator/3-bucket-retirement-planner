@@ -4,8 +4,8 @@
   "description": "Plan your retirement with the 3-bucket investment strategy",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#0f172a",
-  "theme_color": "#1e3a5f",
+  "background_color": "#f7f5f4",
+  "theme_color": "#e87a14",
   "orientation": "portrait-primary",
   "icons": [
     {
