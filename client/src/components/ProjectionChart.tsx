@@ -110,6 +110,72 @@ export function ProjectionChart({ useTargets = false }: ProjectionChartProps) {
         </Card>
       )}
 
+      {/* What's driving this result */}
+      {(() => {
+        const ssMonthly = scenario.profile.socialSecurityAmount ?? 0;
+        const spouseSsMonthly = scenario.profile.spouseSocialSecurityAmount ?? 0;
+        const totalSsMonthly = ssMonthly + spouseSsMonthly;
+        const totalSsAnnual = totalSsMonthly * 12;
+        const spendingAnnual = scenario.profile.monthlySpending * 12;
+        const ssCoverage = Math.round((totalSsAnnual / spendingAnnual) * 100);
+        const age67 = data.find(d => d.age === scenario.profile.socialSecurityAge);
+        const finalRow = data[data.length - 1];
+        const bc = scenario.bucketConfig;
+        const blended = (
+          bc.cashTarget * (bc.cashReturn / 100) +
+          bc.bridgeTarget * (bc.bridgeReturn / 100) +
+          bc.growthTarget * (bc.growthReturn / 100)
+        ) / (bc.cashTarget + bc.bridgeTarget + bc.growthTarget);
+        return (
+          <Card className="border-muted bg-muted/10" data-testid="card-assumptions-insight">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-semibold">Why does this differ from other tools?</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="rounded-md border bg-background p-3">
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold mb-1">Blended Return Rate</p>
+                  <p className="text-lg font-mono font-bold">{(blended * 100).toFixed(1)}%</p>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">
+                    Cash {bc.cashReturn}% · Bridge {bc.bridgeReturn}% · Growth {bc.growthReturn}%
+                    <br/>Change in Settings → Buckets.
+                  </p>
+                </div>
+                <div className={`rounded-md border p-3 ${totalSsMonthly > 0 ? 'bg-primary/5 border-primary/20' : 'bg-background'}`}>
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold mb-1">Social Security Income</p>
+                  {totalSsMonthly > 0 ? (
+                    <>
+                      <p className="text-lg font-mono font-bold">${totalSsMonthly.toLocaleString()}/mo</p>
+                      <p className="text-[11px] text-muted-foreground mt-0.5">
+                        Covers <strong>{ssCoverage}%</strong> of spending in today's dollars after age {scenario.profile.socialSecurityAge}.
+                        {age67 && <> Portfolio only needs ${Math.round(age67.withdrawalNeeded / 1000)}K/yr by then.</>}
+                        {' '}Many tools exclude SS or use different amounts.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-lg font-mono font-bold">$0</p>
+                      <p className="text-[11px] text-muted-foreground mt-0.5">No SS income set. Add it in Settings → Profile to see the full picture.</p>
+                    </>
+                  )}
+                </div>
+                <div className="rounded-md border bg-background p-3">
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold mb-1">Starting Portfolio</p>
+                  <p className="text-lg font-mono font-bold">
+                    ${Math.round((bc.cashTarget + bc.bridgeTarget + bc.growthTarget) / 1000)}K
+                  </p>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">
+                    {useTargets
+                      ? 'Simulated from fully-funded targets. Enter your actual holdings for a real starting balance.'
+                      : `Your bucketed holdings. Ending balance at ${finalRow?.age ?? scenario.profile.lifeExpectancy}: $${Math.round((finalRow?.totalPortfolio ?? 0) / 1000)}K.`}
+                  </p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        );
+      })()}
+
       <ErrorBoundary fallbackTitle="Stress Test Error">
         {monteCarlo && (() => {
           const pct = Math.round(monteCarlo.successRate * 100);

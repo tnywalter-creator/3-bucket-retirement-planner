@@ -45,9 +45,9 @@ const DEFAULT_PROFILE: UserProfile = {
 };
 
 const DEFAULT_BUCKET_CONFIG: BucketConfig = {
-  cashReturn: 4.5,
-  bridgeReturn: 6.5,
-  growthReturn: 8.5,
+  cashReturn: 4.0,
+  bridgeReturn: 6.0,
+  growthReturn: 7.0,
   cashTargetYears: 3,
   bridgeTargetYears: 7,
   cashTarget: 288000,
@@ -62,6 +62,9 @@ const DEFAULT_SCENARIO: Scenario = {
   profile: DEFAULT_PROFILE,
   bucketConfig: DEFAULT_BUCKET_CONFIG,
 };
+
+// Old aggressive defaults — if a scenario still has these exact values, bump them down.
+const OLD_RETURNS = { cashReturn: 4.5, bridgeReturn: 6.5, growthReturn: 8.5 };
 
 function migrateState(persistedState: any): any {
   if (!persistedState) return persistedState;
@@ -110,6 +113,21 @@ function migrateState(persistedState: any): any {
         return {
           ...s,
           profile: { ...s.profile, taxConfig: DEFAULT_PROFILE.taxConfig }
+        };
+      }
+      // v2→v3: if return rates are still at the old aggressive defaults, update them.
+      if (bc &&
+          bc.cashReturn === OLD_RETURNS.cashReturn &&
+          bc.bridgeReturn === OLD_RETURNS.bridgeReturn &&
+          bc.growthReturn === OLD_RETURNS.growthReturn) {
+        return {
+          ...s,
+          bucketConfig: {
+            ...bc,
+            cashReturn: DEFAULT_BUCKET_CONFIG.cashReturn,
+            bridgeReturn: DEFAULT_BUCKET_CONFIG.bridgeReturn,
+            growthReturn: DEFAULT_BUCKET_CONFIG.growthReturn,
+          }
         };
       }
       return s;
