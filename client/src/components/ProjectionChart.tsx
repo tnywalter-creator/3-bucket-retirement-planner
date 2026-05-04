@@ -7,33 +7,48 @@ import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/com
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { CalendarClock, TrendingUp, Activity } from 'lucide-react';
 
-export function ProjectionChart() {
+interface ProjectionChartProps {
+  useTargets?: boolean;
+}
+
+export function ProjectionChart({ useTargets = false }: ProjectionChartProps) {
   const { activeScenarioId, scenarios, holdings, accounts } = useStore();
   const scenario = scenarios.find(s => s.id === activeScenarioId);
 
+  // When useTargets is true, build synthetic holdings from the bucket target amounts
+  // so the user can see a fully-funded projection before entering real positions.
+  const effectiveHoldings = useMemo(() => {
+    if (!useTargets || !scenario) return holdings;
+    const bc = scenario.bucketConfig;
+    return [
+      { id: '__target_cash', ticker: 'CASH', name: 'Cash Reserve (target)', bucket: 'cash' as const, quantity: bc.cashTarget, currentPrice: 1, accountId: '__target', type: 'cash' as const, lastUpdated: '', isManualPrice: true },
+      { id: '__target_bridge', ticker: 'BRIDGE', name: 'Bridge (target)', bucket: 'bridge' as const, quantity: bc.bridgeTarget, currentPrice: 1, accountId: '__target', type: 'etf' as const, lastUpdated: '', isManualPrice: true },
+      { id: '__target_growth', ticker: 'GROWTH', name: 'Growth (target)', bucket: 'growth' as const, quantity: bc.growthTarget, currentPrice: 1, accountId: '__target', type: 'etf' as const, lastUpdated: '', isManualPrice: true },
+    ];
+  }, [useTargets, scenario, holdings]);
+
   const data = useMemo(() => {
     if (!scenario) return [];
-    return runProjection(scenario.profile, scenario.bucketConfig, holdings, { accounts });
-  }, [scenario, holdings, accounts]);
+    return runProjection(scenario.profile, scenario.bucketConfig, effectiveHoldings, { accounts: useTargets ? [] : accounts });
+  }, [scenario, effectiveHoldings, accounts, useTargets]);
 
   const totalHoldingsValue = holdings.reduce((s, h) => s + h.quantity * h.currentPrice, 0);
   const bucketedValue = holdings
     .filter(h => h.bucket !== 'unassigned')
     .reduce((s, h) => s + h.quantity * h.currentPrice, 0);
-  const allUnassigned = totalHoldingsValue > 0 && bucketedValue === 0;
-  const partiallyUnassigned = totalHoldingsValue > 0 && bucketedValue > 0 && bucketedValue < totalHoldingsValue * 0.95;
+  const allUnassigned = !useTargets && totalHoldingsValue > 0 && bucketedValue === 0;
+  const partiallyUnassigned = !useTargets && totalHoldingsValue > 0 && bucketedValue > 0 && bucketedValue < totalHoldingsValue * 0.95;
 
   const ssComparison = useMemo(() => {
     if (!scenario) return [];
-    return compareSSClaimingAges(scenario.profile, scenario.bucketConfig, holdings);
-  }, [scenario, holdings]);
+    return compareSSClaimingAges(scenario.profile, scenario.bucketConfig, effectiveHoldings);
+  }, [scenario, effectiveHoldings]);
 
-  // Full Monte Carlo: 1000 trials. Seeded so the chart is stable across renders;
-  // remove the seed if you'd rather see fresh stochastic draws on each visit.
+  // Full Monte Carlo: 1000 trials. Seeded so the chart is stable across renders.
   const monteCarlo = useMemo(() => {
-    if (!scenario || holdings.length === 0) return null;
-    return runMonteCarlo(scenario.profile, scenario.bucketConfig, holdings, accounts, { trials: 1000, seed: 42 });
-  }, [scenario, holdings, accounts]);
+    if (!scenario || effectiveHoldings.length === 0) return null;
+    return runMonteCarlo(scenario.profile, scenario.bucketConfig, effectiveHoldings, useTargets ? [] : accounts, { trials: 1000, seed: 42 });
+  }, [scenario, effectiveHoldings, accounts, useTargets]);
 
   if (!scenario || data.length === 0) return <div className="text-muted-foreground text-sm p-4">No data to project</div>;
 
