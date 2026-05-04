@@ -37,14 +37,18 @@ export default function ReportPage() {
   const handlePrint = () => window.print();
 
   const handleExportCSV = () => {
-    const headers = ['Year', 'Age', 'Spending Need', 'Income', 'Withdrawal', 'Tax', 'Cash Balance', 'Bridge Balance', 'Growth Balance', 'Total Portfolio', 'Source'];
-    const rows = data.map(d => [
-      d.year, d.age,
-      Math.round(d.spendingNeed), Math.round(d.income),
-      Math.round(d.withdrawalNeeded), Math.round(d.taxOnWithdrawal),
-      Math.round(d.endBalanceCash), Math.round(d.endBalanceBridge), Math.round(d.endBalanceGrowth),
-      Math.round(d.totalPortfolio), d.withdrawalSource
-    ]);
+    const headers = ['Year', 'Age', 'Spending Need', 'Income', 'Net Withdrawal', 'Portfolio Draw (Gross)', 'Tax', 'Start Balance', 'Cash End', 'Bridge End', 'Growth End', 'End Total', 'Source', 'Phase'];
+    const rows = data.map(d => {
+      const startTotal = d.startBalanceCash + d.startBalanceBridge + d.startBalanceGrowth;
+      return [
+        d.year, d.age,
+        Math.round(d.spendingNeed), Math.round(d.income),
+        Math.round(d.withdrawalNeeded), Math.round(d.grossWithdrawal), Math.round(d.taxOnWithdrawal),
+        Math.round(startTotal),
+        Math.round(d.endBalanceCash), Math.round(d.endBalanceBridge), Math.round(d.endBalanceGrowth),
+        Math.round(d.totalPortfolio), d.withdrawalSource, d.withdrawalPhase
+      ];
+    });
     const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
@@ -177,7 +181,7 @@ export default function ReportPage() {
 
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="font-serif text-base">Year-by-Year Projection (First 15 Years)</CardTitle>
+            <CardTitle className="font-serif text-base">Year-by-Year Projection (First 20 Years)</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="overflow-x-auto">
@@ -187,28 +191,47 @@ export default function ReportPage() {
                     <th className="text-left py-1.5 pr-2">Age</th>
                     <th className="text-right py-1.5 px-2">Spending</th>
                     <th className="text-right py-1.5 px-2">Income</th>
-                    <th className="text-right py-1.5 px-2">Withdrawal</th>
+                    <th className="text-right py-1.5 px-2 text-muted-foreground">Start Balance</th>
+                    <th className="text-right py-1.5 px-2">Portfolio Draw</th>
+                    <th className="text-right py-1.5 px-2 text-amber-600 dark:text-amber-400">Tax</th>
                     <th className="text-right py-1.5 px-2">Cash</th>
                     <th className="text-right py-1.5 px-2">Bridge</th>
                     <th className="text-right py-1.5 px-2">Growth</th>
-                    <th className="text-right py-1.5 pl-2">Total</th>
+                    <th className="text-right py-1.5 pl-2">End Total</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {data.slice(0, 15).map(d => (
-                    <tr key={d.age} className="border-b border-dashed">
-                      <td className="py-1.5 pr-2 font-semibold">{d.age}</td>
-                      <td className="text-right py-1.5 px-2 font-mono">${(d.spendingNeed/1000).toFixed(0)}K</td>
-                      <td className="text-right py-1.5 px-2 font-mono">${(d.income/1000).toFixed(0)}K</td>
-                      <td className="text-right py-1.5 px-2 font-mono">${(d.withdrawalNeeded/1000).toFixed(0)}K</td>
-                      <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceCash/1000).toFixed(0)}K</td>
-                      <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceBridge/1000).toFixed(0)}K</td>
-                      <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceGrowth/1000).toFixed(0)}K</td>
-                      <td className="text-right py-1.5 pl-2 font-mono font-semibold">${d.totalPortfolio >= 1000000 ? `${(d.totalPortfolio/1000000).toFixed(2)}M` : `${(d.totalPortfolio/1000).toFixed(0)}K`}</td>
-                    </tr>
-                  ))}
+                  {data.slice(0, 20).map(d => {
+                    const startTotal = d.startBalanceCash + d.startBalanceBridge + d.startBalanceGrowth;
+                    const endTotal = d.totalPortfolio;
+                    const grew = endTotal > startTotal;
+                    return (
+                      <tr key={d.age} className="border-b border-dashed hover:bg-muted/20">
+                        <td className="py-1.5 pr-2 font-semibold">{d.age}</td>
+                        <td className="text-right py-1.5 px-2 font-mono">${(d.spendingNeed/1000).toFixed(0)}K</td>
+                        <td className="text-right py-1.5 px-2 font-mono text-primary">${(d.income/1000).toFixed(0)}K</td>
+                        <td className="text-right py-1.5 px-2 font-mono text-muted-foreground">${startTotal >= 1000000 ? `${(startTotal/1000000).toFixed(2)}M` : `${(startTotal/1000).toFixed(0)}K`}</td>
+                        <td className="text-right py-1.5 px-2 font-mono font-semibold text-destructive">
+                          {d.grossWithdrawal > 0 ? `–$${(d.grossWithdrawal/1000).toFixed(0)}K` : '—'}
+                        </td>
+                        <td className="text-right py-1.5 px-2 font-mono text-amber-600 dark:text-amber-400">
+                          {d.taxOnWithdrawal > 0 ? `$${(d.taxOnWithdrawal/1000).toFixed(0)}K` : '—'}
+                        </td>
+                        <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceCash/1000).toFixed(0)}K</td>
+                        <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceBridge/1000).toFixed(0)}K</td>
+                        <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceGrowth/1000).toFixed(0)}K</td>
+                        <td className={`text-right py-1.5 pl-2 font-mono font-semibold ${grew ? 'text-primary' : 'text-foreground'}`}>
+                          ${endTotal >= 1000000 ? `${(endTotal/1000000).toFixed(2)}M` : `${(endTotal/1000).toFixed(0)}K`}
+                          {grew && <span className="text-[9px] text-primary ml-0.5">↑</span>}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
+              <p className="text-[10px] text-muted-foreground mt-2">
+                "Portfolio Draw" is the gross amount removed from your accounts (net spending + taxes). "End Total" reflects growth applied after the draw — a rising total means investment returns exceeded withdrawals that year.
+              </p>
             </div>
           </CardContent>
         </Card>

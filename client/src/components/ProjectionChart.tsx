@@ -16,6 +16,13 @@ export function ProjectionChart() {
     return runProjection(scenario.profile, scenario.bucketConfig, holdings, { accounts });
   }, [scenario, holdings, accounts]);
 
+  const totalHoldingsValue = holdings.reduce((s, h) => s + h.quantity * h.currentPrice, 0);
+  const bucketedValue = holdings
+    .filter(h => h.bucket !== 'unassigned')
+    .reduce((s, h) => s + h.quantity * h.currentPrice, 0);
+  const allUnassigned = totalHoldingsValue > 0 && bucketedValue === 0;
+  const partiallyUnassigned = totalHoldingsValue > 0 && bucketedValue > 0 && bucketedValue < totalHoldingsValue * 0.95;
+
   const ssComparison = useMemo(() => {
     if (!scenario) return [];
     return compareSSClaimingAges(scenario.profile, scenario.bucketConfig, holdings);
@@ -29,6 +36,21 @@ export function ProjectionChart() {
   }, [scenario, holdings, accounts]);
 
   if (!scenario || data.length === 0) return <div className="text-muted-foreground text-sm p-4">No data to project</div>;
+
+  if (allUnassigned) {
+    return (
+      <Card className="border-destructive bg-destructive/5" data-testid="card-unassigned-warning">
+        <CardContent className="p-4 space-y-1">
+          <p className="text-sm font-semibold text-destructive">
+            You have ${(totalHoldingsValue / 1000).toFixed(0)}K in holdings but none are assigned to a bucket.
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Go to <strong>Holdings</strong> and assign each position to Cash Reserve, Bridge, or Growth — the projection needs bucket assignments to model your portfolio correctly.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
 
   const depletionYear = data.find(d => d.totalPortfolio <= 0);
   const finalBalance = data[data.length - 1]?.totalPortfolio || 0;
@@ -50,6 +72,19 @@ export function ProjectionChart() {
 
   return (
     <div className="space-y-8">
+      {partiallyUnassigned && (
+        <Card className="border-amber-500 bg-amber-500/5" data-testid="card-partial-unassigned-warning">
+          <CardContent className="p-4">
+            <p className="text-sm font-semibold text-amber-700 dark:text-amber-400">
+              ${((totalHoldingsValue - bucketedValue) / 1000).toFixed(0)}K of your holdings are unassigned and excluded from this projection.
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Assign all holdings in the <strong>Holdings</strong> page for an accurate forecast.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       {depletionYear && (
         <Card className="border-destructive bg-destructive/5" data-testid="card-depletion-warning">
           <CardContent className="p-4">
