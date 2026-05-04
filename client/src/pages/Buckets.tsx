@@ -11,6 +11,10 @@ import { Clock, ArrowRight, ArrowUp, ArrowDown, Check } from 'lucide-react';
 import { calculateRebalancing } from '@/lib/rebalance';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 
+// Bound a numeric input to a sane range.
+const clamp = (n: number, min: number, max: number) =>
+  Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : min;
+
 export default function BucketsPage() {
   const { activeScenarioId, scenarios, updateBucketConfig, holdings } = useStore();
   const scenario = scenarios.find(s => s.id === activeScenarioId);
@@ -170,21 +174,21 @@ export default function BucketsPage() {
                     <Separator />
                     <div className="space-y-2">
                         <Label>Withdrawal Rate %</Label>
-                        <Input type="number" step="0.25" value={bc.withdrawalRate} onChange={(e) => updateBucketConfig({ withdrawalRate: Number(e.target.value) })} data-testid="input-withdrawal-rate" />
+                        <Input type="number" step="0.25" min={1} max={15} value={bc.withdrawalRate} onChange={(e) => updateBucketConfig({ withdrawalRate: clamp(Number(e.target.value), 1, 15) })} data-testid="input-withdrawal-rate" />
                         <p className="text-[10px] text-muted-foreground">Annual withdrawal as % of portfolio. At {bc.withdrawalRate}%, ${scenario.profile.monthlySpending.toLocaleString()}/mo needs a ${((scenario.profile.monthlySpending * 12) / (bc.withdrawalRate / 100) / 1000000).toFixed(2)}M portfolio. B3 = total needed minus B1 and B2.</p>
                     </div>
                     <div className="grid grid-cols-3 gap-3">
                       <div className="space-y-1.5">
                         <Label className="text-xs">B1 Target $</Label>
-                        <Input type="number" value={bc.cashTarget} onChange={(e) => updateBucketConfig({ cashTarget: Number(e.target.value) })} data-testid="input-cash-target" />
+                        <Input type="number" min={0} max={50000000} value={bc.cashTarget} onChange={(e) => updateBucketConfig({ cashTarget: clamp(Number(e.target.value), 0, 50000000) })} data-testid="input-cash-target" />
                       </div>
                       <div className="space-y-1.5">
                         <Label className="text-xs">B2 Target $</Label>
-                        <Input type="number" value={bc.bridgeTarget} onChange={(e) => updateBucketConfig({ bridgeTarget: Number(e.target.value) })} data-testid="input-bridge-target" />
+                        <Input type="number" min={0} max={50000000} value={bc.bridgeTarget} onChange={(e) => updateBucketConfig({ bridgeTarget: clamp(Number(e.target.value), 0, 50000000) })} data-testid="input-bridge-target" />
                       </div>
                       <div className="space-y-1.5">
                         <Label className="text-xs">B3 Target $</Label>
-                        <Input type="number" value={bc.growthTarget} onChange={(e) => updateBucketConfig({ growthTarget: Number(e.target.value) })} data-testid="input-growth-target" />
+                        <Input type="number" min={0} max={50000000} value={bc.growthTarget} onChange={(e) => updateBucketConfig({ growthTarget: clamp(Number(e.target.value), 0, 50000000) })} data-testid="input-growth-target" />
                       </div>
                     </div>
                 </CardContent>
@@ -199,17 +203,17 @@ export default function BucketsPage() {
                      <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-2">
                             <Label>Cash Return %</Label>
-                            <Input type="number" value={bc.cashReturn} onChange={(e) => updateBucketConfig({ cashReturn: Number(e.target.value) })} data-testid="input-cash-return" />
+                            <Input type="number" step="0.25" min={0} max={20} value={bc.cashReturn} onChange={(e) => updateBucketConfig({ cashReturn: clamp(Number(e.target.value), 0, 20) })} data-testid="input-cash-return" />
                             <p className="text-[10px] text-muted-foreground">HYSA / Money Market</p>
                         </div>
                         <div className="space-y-2">
                             <Label>Bridge Return %</Label>
-                            <Input type="number" value={bc.bridgeReturn} onChange={(e) => updateBucketConfig({ bridgeReturn: Number(e.target.value) })} data-testid="input-bridge-return" />
+                            <Input type="number" step="0.25" min={0} max={25} value={bc.bridgeReturn} onChange={(e) => updateBucketConfig({ bridgeReturn: clamp(Number(e.target.value), 0, 25) })} data-testid="input-bridge-return" />
                             <p className="text-[10px] text-muted-foreground">Diversified mix</p>
                         </div>
                         <div className="space-y-2">
                             <Label>Growth Return %</Label>
-                            <Input type="number" value={bc.growthReturn} onChange={(e) => updateBucketConfig({ growthReturn: Number(e.target.value) })} data-testid="input-growth-return" />
+                            <Input type="number" step="0.25" min={0} max={30} value={bc.growthReturn} onChange={(e) => updateBucketConfig({ growthReturn: clamp(Number(e.target.value), 0, 30) })} data-testid="input-growth-return" />
                             <p className="text-[10px] text-muted-foreground">Stocks / Aggressive</p>
                         </div>
                         <div className="space-y-2">

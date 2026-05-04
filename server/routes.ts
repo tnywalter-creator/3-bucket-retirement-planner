@@ -7,46 +7,57 @@ export async function registerRoutes(
 ): Promise<Server> {
   // Market data proxy endpoint
   // Uses Yahoo Finance API (free, no key required)
+  // Whitelist tickers to prevent SSRF via path injection.
+  // Allows letters, digits, dot, hyphen — covers ETFs, ADRs, share classes (BRK.B), bond suffixes (ORCL.GP).
+  const TICKER_REGEX = /^[A-Z0-9.\-]{1,10}$/i;
+
   app.get("/api/quote/:ticker", async (req, res) => {
     const { ticker } = req.params;
-    
+
+    if (!TICKER_REGEX.test(ticker)) {
+      return res.status(400).json({ error: 'Invalid ticker format' });
+    }
+
     try {
       // Using Yahoo Finance v8 API (public, no auth required)
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`;
-      
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0'
-        }
-      });
+      const safeTicker = encodeURIComponent(ticker);
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${safeTicker}?interval=1d&range=1d`;
+
+      // Abort after 8s so a slow upstream can't pile up requests.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
 
       if (!response.ok) {
-        return res.status(404).json({ 
-          error: 'Ticker not found',
-          ticker 
-        });
+        return res.status(404).json({ error: 'Ticker not found', ticker });
       }
 
       const data = await response.json();
       const result = data?.chart?.result?.[0];
-      
+
       if (!result) {
-        return res.status(404).json({ 
-          error: 'No data available',
-          ticker 
-        });
+        return res.status(404).json({ error: 'No data available', ticker });
       }
 
       const meta = result.meta;
       const quote = result.indicators?.quote?.[0];
-      
+
       // Get current price (last close or current market price)
       const currentPrice = meta.regularMarketPrice || quote?.close?.[quote.close.length - 1];
       const previousClose = meta.previousClose;
-      
+
       // Calculate change percentage
-      const changePercent = previousClose && currentPrice 
-        ? ((currentPrice - previousClose) / previousClose) * 100 
+      const changePercent = previousClose && currentPrice
+        ? ((currentPrice - previousClose) / previousClose) * 100
         : 0;
 
       res.json({
@@ -57,49 +68,67 @@ export async function registerRoutes(
       });
 
     } catch (error) {
+      // Log details server-side, return generic message to client (don't leak internals).
       console.error(`Error fetching quote for ${ticker}:`, error);
-      res.status(500).json({ 
-        error: 'Failed to fetch market data',
-        ticker,
-        message: error instanceof Error ? error.message : 'Unknown error'
-      });
+      res.status(500).json({ error: 'Failed to fetch market data' });
     }
   });
 
   // PDF parsing endpoint
+  // Hard caps: 8MB decoded (≈11MB base64), 50 pages, 25s total parse time.
+  const MAX_PDF_BYTES = 8 * 1024 * 1024;
+  const MAX_PDF_PAGES = 50;
+  const PDF_PARSE_TIMEOUT_MS = 25_000;
+
   app.post("/api/parse-pdf", async (req, res) => {
     try {
       const { pdfBase64 } = req.body;
-      
-      if (!pdfBase64) {
+
+      if (!pdfBase64 || typeof pdfBase64 !== 'string') {
         return res.status(400).json({ error: 'No PDF data provided' });
       }
 
-      const pdfBuffer = Buffer.from(pdfBase64, 'base64');
-      const pdfData = new Uint8Array(pdfBuffer);
-      
-      // Use pdfjs-dist for PDF parsing
-      const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
-      const loadingTask = pdfjsLib.getDocument({ data: pdfData });
-      const pdfDoc = await loadingTask.promise;
-      
-      let fullText = '';
-      for (let i = 1; i <= pdfDoc.numPages; i++) {
-        const page = await pdfDoc.getPage(i);
-        const textContent = await page.getTextContent();
-        const pageText = textContent.items.map((item: any) => item.str).join(' ');
-        fullText += pageText + '\n';
+      // Reject oversized payloads BEFORE allocating a Buffer.
+      // base64 expands by 4/3, so a decoded cap of 8MB ≈ ~10.7MB encoded.
+      if (pdfBase64.length > Math.ceil(MAX_PDF_BYTES * 4 / 3)) {
+        return res.status(413).json({ error: 'PDF too large (max 8MB)' });
       }
 
+      const pdfBuffer = Buffer.from(pdfBase64, 'base64');
+      if (pdfBuffer.length > MAX_PDF_BYTES) {
+        return res.status(413).json({ error: 'PDF too large (max 8MB)' });
+      }
+
+      const pdfData = new Uint8Array(pdfBuffer);
+
+      // Race the parse against a hard timeout.
+      const parsePromise = (async () => {
+        const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+        const loadingTask = pdfjsLib.getDocument({ data: pdfData });
+        const pdfDoc = await loadingTask.promise;
+
+        const pageCount = Math.min(pdfDoc.numPages, MAX_PDF_PAGES);
+        let fullText = '';
+        for (let i = 1; i <= pageCount; i++) {
+          const page = await pdfDoc.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map((item: any) => item.str).join(' ');
+          fullText += pageText + '\n';
+        }
+        return fullText;
+      })();
+
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('PDF parse timeout')), PDF_PARSE_TIMEOUT_MS)
+      );
+
+      const fullText = await Promise.race([parsePromise, timeoutPromise]);
       const holdings = parsePDFText(fullText);
-      
+
       res.json({ holdings, rawText: fullText, textLength: fullText.length });
     } catch (error) {
       console.error('Error parsing PDF:', error);
-      res.status(500).json({ 
-        error: 'Failed to parse PDF',
-        message: error instanceof Error ? error.message : 'Unknown error'
-      });
+      res.status(500).json({ error: 'Failed to parse PDF' });
     }
   });
 
@@ -300,7 +329,15 @@ function parsePDFText(text: string): Array<{ticker: string, name: string, shares
 function inferBucketFromTicker(ticker: string): string {
   const t = ticker.toUpperCase();
   
-  const cashFunds = ['SPAXX', 'FDRXX', 'VMFXX', 'SWVXX', 'SPRXX', 'FDLXX', 'FZFXX', 'FGTXX', 'MFIS', 'MFRS', 'CASH'];
+  // Money market funds and cash equivalents from major brokerages (Fidelity, Schwab, Vanguard, etc.)
+  const cashFunds = [
+    'SPAXX', 'FDRXX', 'VMFXX', 'SWVXX', 'SPRXX', 'FDLXX', 'FZFXX', 'FGTXX',
+    'FCASH',           // Fidelity Cash Reserves (was misclassified as growth)
+    'SNVXX', 'SNAXX',  // Schwab Government MMF
+    'VUSXX', 'VFFXX',  // Vanguard Treasury / Federal MMF
+    'TTTXX',           // BlackRock Liquidity
+    'MFIS', 'MFRS', 'CASH'
+  ];
   if (cashFunds.some(c => t.includes(c)) || t === 'CASH' || t.includes('MONEY') || t.includes('DEPOSIT')) return 'cash';
   
   const bondFunds = ['BND', 'AGG', 'TIP', 'TIPS', 'VTIP', 'SCHZ', 'IUSB', 'VBTLX', 'BOND', 'GOVT', 'LQD', 'HYG', 'JNK', 'MUB', 'TLT', 'IEF', 'SHY', 'VCIT', 'VCSH', 'BSV', 'BIV', 'BLV', 'VAIPX', 'VBMFX', 'FBNDX', 'VGIT', 'IGIB', 'USHY', 'LBNOX', 'JCBUX', 'VWOB', 'PIMCO'];

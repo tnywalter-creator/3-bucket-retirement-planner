@@ -1,0 +1,3489 @@
+# Apply 3-Bucket Retirement Planner Code Review (Rounds 1+2+3)
+
+Hi Replit AI — please apply the following 19 file changes from a code review. **Don't second-guess the contents** — they're already verified to compile clean (`tsc --noEmit`) and pass 29 unit tests. Just write the files exactly as shown.
+
+## What you'll do
+
+1. **Create or overwrite** each file below with the exact content shown.
+2. **Run the tests** to confirm everything works:
+   - `npx tsx client/src/lib/engine.test.ts` → expect "11 passed, 0 failed"
+   - `npx tsx client/src/lib/montecarlo.test.ts` → expect "18 passed, 0 failed"
+3. **Commit and push** with the message: `Rounds 1-3: tax math, security, UI polish, Monte Carlo`
+
+## Why these changes
+
+- **Round 1 (trust the math)**: tax gross-up was wrong direction (`net*(1+r)` instead of `net/(1-r)`); federal+state averaged instead of summed; SSRF risk in ticker proxy; PDF endpoint had no size cap; FCASH misclassified as growth; no input validation; no projection memoization; no dashboard bucket-gap callout; no engine tests.
+- **Round 2 (look professional)**: custom SVG brand mark; refined heading hierarchy (only h1 brand-orange); polished sidebar with active-scenario chip; replaced cluttered 4-up dashboard cards with proper hero card; removed personal "Growth + consulting closes gap" copy; SVG favicon; better OpenGraph.
+- **Round 3 (stress test)**: Monte Carlo simulation (1,000 trials, normal-distributed returns); account-type-aware tax model (Roth=0, Traditional=ordinary, Brokerage=cap gains); RMDs at age 73+ via IRS Uniform Lifetime Table; spouse work income now stops at retirement and inflates while working; new dashboard probability-of-success card; new Projection page percentile fan chart.
+
+---
+
+## Files to create or overwrite
+
+
+### client/src/lib/rmd.ts
+
+```ts
+/**
+ * Required Minimum Distributions (RMDs) for Traditional IRA / 401(k) / 403(b) / etc.
+ *
+ * Under SECURE Act 2.0 (effective 2023), RMDs begin at age 73. Roth IRAs are exempt
+ * during the owner's lifetime. HSAs are exempt. Taxable brokerage accounts have no RMD.
+ *
+ * Source: IRS Uniform Lifetime Table (Publication 590-B, Appendix B, Table III).
+ * RMD = traditional retirement balance (prior 12/31) / divisor for current age.
+ */
+
+// IRS Uniform Lifetime Table — divisors by age. Truncated/extrapolated for ages 116+.
+// Each entry: divisor used to compute RMD for that age.
+const UNIFORM_LIFETIME_TABLE: Record<number, number> = {
+  73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1, 80: 20.2,
+  81: 19.4, 82: 18.5, 83: 17.7, 84: 16.8, 85: 16.0, 86: 15.2, 87: 14.4, 88: 13.7,
+  89: 12.9, 90: 12.2, 91: 11.5, 92: 10.8, 93: 10.1, 94: 9.5,  95: 8.9,  96: 8.4,
+  97: 7.8,  98: 7.3,  99: 6.8,  100: 6.4, 101: 6.0, 102: 5.6, 103: 5.2, 104: 4.9,
+  105: 4.6, 106: 4.3, 107: 4.1, 108: 3.9, 109: 3.7, 110: 3.5, 111: 3.4, 112: 3.3,
+  113: 3.1, 114: 3.0, 115: 2.9,
+};
+
+/** Age at which RMDs become required under SECURE Act 2.0 (rises to 75 for those born 1960+). */
+export const RMD_START_AGE = 73;
+
+/** Returns the RMD for the given age and traditional retirement balance. 0 if age < 73. */
+export function calculateRMD(traditionalBalance: number, age: number): number {
+  if (age < RMD_START_AGE || traditionalBalance <= 0) return 0;
+  const divisor = UNIFORM_LIFETIME_TABLE[age] ?? UNIFORM_LIFETIME_TABLE[115];
+  return traditionalBalance / divisor;
+}
+
+/** Whether an RMD is required at this age. */
+export function isRMDAge(age: number): boolean {
+  return age >= RMD_START_AGE;
+}
+```
+
+### client/src/lib/engine.ts
+
+```ts
+import { UserProfile, BucketConfig, Holding, BucketType, TaxConfig, Account, AccountType } from './types';
+import { calculateRMD, isRMDAge } from './rmd';
+
+export interface YearProjection {
+  year: number;
+  age: number;
+  spendingNeed: number;
+  income: number;
+  withdrawalNeeded: number;
+  taxOnWithdrawal: number;
+  grossWithdrawal: number;
+  
+  startBalanceCash: number;
+  startBalanceBridge: number;
+  startBalanceGrowth: number;
+  
+  endBalanceCash: number;
+  endBalanceBridge: number;
+  endBalanceGrowth: number;
+  
+  totalPortfolio: number;
+  withdrawalSource: string;
+  withdrawalPhase: string;
+  action: string;
+  
+  ssIncome: number;
+  spouseSsIncome: number;
+  otherIncome: number;
+  spouseWorkIncome: number;
+
+  // Round 3 additions
+  rmdRequired: number;        // The minimum the IRS forces this year
+  rmdSatisfied: boolean;      // Whether the actual withdrawal met or exceeded RMD
+}
+
+/** Optional per-year return overrides (used by Monte Carlo to inject stochastic draws). */
+export interface ReturnOverrides {
+  cash?: number[];
+  bridge?: number[];
+  growth?: number[];
+}
+
+/** Run options bundle so we can grow without breaking the call signature. */
+export interface RunOptions {
+  accounts?: Account[];
+  returnOverrides?: ReturnOverrides;
+}
+
+const DEFAULT_TAX: TaxConfig = { federalRate: 22, stateRate: 5, capitalGainsRate: 15 };
+
+/**
+ * Build a per-bucket map of dollars by account type, used for weighted tax rate.
+ * If no accounts are supplied, every dollar is treated as ordinary (legacy behavior).
+ */
+function buildBucketAccountMix(
+  holdings: Holding[],
+  accounts: Account[] | undefined,
+): Record<BucketType, Record<AccountType, number>> {
+  const empty = (): Record<AccountType, number> =>
+    ({ taxable: 0, traditional_ira: 0, roth_ira: 0, '401k': 0, hsa: 0, other: 0 });
+  const mix: Record<BucketType, Record<AccountType, number>> = {
+    cash: empty(), bridge: empty(), growth: empty(), unassigned: empty(),
+  };
+  if (!accounts || accounts.length === 0) {
+    // No account info: lump everything into 'other' so the legacy bucket-only tax fallback runs.
+    for (const h of holdings) {
+      mix[h.bucket].other += h.quantity * h.currentPrice;
+    }
+    return mix;
+  }
+  const accountTypeById = new Map(accounts.map(a => [a.id, a.type]));
+  for (const h of holdings) {
+    const type = (accountTypeById.get(h.accountId) ?? 'other') as AccountType;
+    mix[h.bucket][type] += h.quantity * h.currentPrice;
+  }
+  return mix;
+}
+
+/**
+ * Effective withdrawal tax rate, weighted by the account types holding dollars in this bucket.
+ *  - Roth IRA:        0% (qualified distributions)
+ *  - HSA:             0% (assumed qualified medical use; conservative for retirees on Medicare)
+ *  - Traditional IRA / 401k:  ordinary income (fed + state)
+ *  - Taxable brokerage:        cap gains (treated like the bridge legacy logic)
+ *  - "other" / unknown:        legacy fallback to phase-based rate
+ */
+function getWeightedTaxRate(
+  tax: TaxConfig,
+  phase: 'cash' | 'bridge' | 'growth',
+  bucketMix: Record<AccountType, number>,
+): number {
+  if (phase === 'cash') return 0; // HYSA / cash equivalents
+  const total = Object.values(bucketMix).reduce((s, v) => s + v, 0);
+  if (total <= 0) return getLegacyEffectiveRate(tax, phase);
+
+  const ordinary = tax.federalRate + tax.stateRate;
+  const capGains = tax.capitalGainsRate + tax.stateRate;
+  const fallback = getLegacyEffectiveRate(tax, phase);
+
+  let weightedRate = 0;
+  weightedRate += (bucketMix.roth_ira / total) * 0;
+  weightedRate += (bucketMix.hsa / total) * 0;
+  weightedRate += (bucketMix.traditional_ira / total) * ordinary;
+  weightedRate += (bucketMix['401k'] / total) * ordinary;
+  weightedRate += (bucketMix.taxable / total) * capGains;
+  weightedRate += (bucketMix.other / total) * fallback;
+  return weightedRate;
+}
+
+function getLegacyEffectiveRate(tax: TaxConfig, phase: 'cash' | 'bridge' | 'growth'): number {
+  if (phase === 'cash') return 0;
+  if (phase === 'bridge') return tax.capitalGainsRate + tax.stateRate;
+  return tax.federalRate + tax.stateRate;
+}
+
+/**
+ * Backwards-compatible shape: existing callers pass (profile, config, holdings).
+ * New callers can pass an options bag with accounts (for account-aware tax) and
+ * returnOverrides (for Monte Carlo).
+ */
+export function runProjection(
+  profile: UserProfile,
+  bucketConfig: BucketConfig,
+  currentHoldings: Holding[],
+  options?: RunOptions,
+): YearProjection[] {
+  const currentYear = new Date().getFullYear();
+  const projections: YearProjection[] = [];
+  const tax = profile.taxConfig || DEFAULT_TAX;
+  const accounts = options?.accounts;
+  const overrides = options?.returnOverrides;
+
+  let cashBal = currentHoldings.filter(h => h.bucket === 'cash').reduce((sum, h) => sum + (h.quantity * h.currentPrice), 0);
+  let bridgeBal = currentHoldings.filter(h => h.bucket === 'bridge').reduce((sum, h) => sum + (h.quantity * h.currentPrice), 0);
+  let growthBal = currentHoldings.filter(h => h.bucket === 'growth').reduce((sum, h) => sum + (h.quantity * h.currentPrice), 0);
+
+  // Snapshot of starting account-type mix per bucket. We assume the mix stays
+  // proportional as the bucket grows/shrinks (a simplification, but better than
+  // ignoring account types entirely).
+  const initialMix = buildBucketAccountMix(currentHoldings, accounts);
+
+  // Track traditional balance separately for RMD calculations.
+  // We approximate it as (initial traditional share of total) * current total.
+  const totalInitial = cashBal + bridgeBal + growthBal;
+  const traditionalShare = totalInitial > 0
+    ? (initialMix.cash.traditional_ira + initialMix.cash['401k']
+     + initialMix.bridge.traditional_ira + initialMix.bridge['401k']
+     + initialMix.growth.traditional_ira + initialMix.growth['401k']) / totalInitial
+    : 0;
+
+  let age = profile.currentAge;
+  const retirementAge = profile.retirementAge ?? profile.currentAge;
+  const endAge = profile.lifeExpectancy;
+  const yearsToProject = endAge - age;
+
+  // retirementYear tracks how many years into retirement we are (0 = first retirement year)
+  let retirementYear = -1;
+
+  for (let i = 0; i <= yearsToProject; i++) {
+    const year = currentYear + i;
+    const isRetired = age >= retirementAge;
+    if (isRetired) retirementYear++;
+
+    const inflationMultiplier = Math.pow(1 + (profile.inflationRate / 100), i);
+    const yearlySpending = profile.monthlySpending * 12 * inflationMultiplier;
+
+    // Returns: prefer Monte Carlo overrides, else config defaults.
+    const cashReturn = overrides?.cash?.[i] ?? bucketConfig.cashReturn / 100;
+    const bridgeReturn = overrides?.bridge?.[i] ?? bucketConfig.bridgeReturn / 100;
+    const growthReturn = overrides?.growth?.[i] ?? bucketConfig.growthReturn / 100;
+
+    let ssIncome = 0;
+    let spouseSsIncome = 0;
+    let spouseWorkIncome = 0;
+    // Other income inflates over time (was a constant before — fixed in round 3).
+    let otherInc = profile.otherIncome * 12 * inflationMultiplier;
+
+    // Spouse work income: assume it stops at the retirement age (treat the retirement
+    // age in the profile as a household event). Inflate while still working.
+    if (profile.spouseIncome && !isRetired) {
+      spouseWorkIncome = profile.spouseIncome * 12 * inflationMultiplier;
+    }
+
+    if (age >= profile.socialSecurityAge) {
+      ssIncome = profile.socialSecurityAmount * 12 * inflationMultiplier;
+    }
+
+    if (profile.spouseAge && profile.spouseSocialSecurityAge && profile.spouseSocialSecurityAmount) {
+      const spouseCurrentAge = (age - profile.currentAge) + profile.spouseAge;
+      if (spouseCurrentAge >= profile.spouseSocialSecurityAge) {
+        spouseSsIncome = profile.spouseSocialSecurityAmount * 12 * inflationMultiplier;
+      }
+    }
+
+    const yearlyIncome = ssIncome + spouseSsIncome + spouseWorkIncome + otherInc;
+
+    const startCash = cashBal;
+    const startBridge = bridgeBal;
+    const startGrowth = growthBal;
+    const startTotal = startCash + startBridge + startGrowth;
+
+    let withdrawalSource = '';
+    let withdrawalPhase = '';
+    let action = '';
+    let withdrawalNeeded = 0;
+    let taxOnWithdrawal = 0;
+    let grossWithdrawal = 0;
+    let rmdRequired = 0;
+    let rmdSatisfied = true;
+
+    if (!isRetired) {
+      withdrawalPhase = 'Pre-Retirement';
+      withdrawalSource = 'Working';
+      withdrawalNeeded = 0;
+      grossWithdrawal = 0;
+
+      cashBal = Math.max(0, cashBal) * (1 + cashReturn);
+      bridgeBal = Math.max(0, bridgeBal) * (1 + bridgeReturn);
+      growthBal = Math.max(0, growthBal) * (1 + growthReturn);
+    } else {
+      withdrawalNeeded = Math.max(0, yearlySpending - yearlyIncome);
+
+      const phase = retirementYear < bucketConfig.cashTargetYears ? 'cash'
+        : retirementYear < bucketConfig.cashTargetYears + bucketConfig.bridgeTargetYears ? 'bridge'
+        : 'growth';
+
+      // Account-type weighted tax rate — accounts param required, otherwise falls back to legacy phase-based rate.
+      const bucketMix = phase === 'cash' ? initialMix.cash : phase === 'bridge' ? initialMix.bridge : initialMix.growth;
+      const effectiveTaxRate = getWeightedTaxRate(tax, phase, bucketMix);
+      const clampedRate = Math.max(0, Math.min(0.95, effectiveTaxRate / 100));
+      grossWithdrawal = withdrawalNeeded / (1 - clampedRate);
+      taxOnWithdrawal = grossWithdrawal - withdrawalNeeded;
+
+      // RMD enforcement — at age 73+, force at least the IRS minimum out of traditional balances.
+      // Approximate traditional balance = traditionalShare * current total.
+      if (isRMDAge(age)) {
+        const approxTradBalance = traditionalShare * startTotal;
+        rmdRequired = calculateRMD(approxTradBalance, age);
+        if (rmdRequired > grossWithdrawal) {
+          // Force the RMD as the gross. Tax is applied at ordinary income on the additional draw.
+          const extra = rmdRequired - grossWithdrawal;
+          const ordinary = (tax.federalRate + tax.stateRate) / 100;
+          taxOnWithdrawal += extra * ordinary;
+          grossWithdrawal = rmdRequired;
+          // The "needed" portion stays the same; the extra goes back into spending margin (not modeled as reinvestment yet).
+          rmdSatisfied = true;
+          action = action ? action + ' + RMD' : 'RMD enforced';
+        }
+      }
+
+      let remaining = grossWithdrawal;
+
+      if (retirementYear < bucketConfig.cashTargetYears) {
+        withdrawalPhase = `Retirement Years 1-${bucketConfig.cashTargetYears}: Cash Reserve`;
+        if (cashBal >= remaining) {
+          cashBal -= remaining;
+          remaining = 0;
+          withdrawalSource = 'Bucket 1 (Cash)';
+        } else {
+          remaining -= cashBal;
+          cashBal = 0;
+          withdrawalSource = 'Cash (Depleted)';
+          if (bridgeBal >= remaining) {
+            bridgeBal -= remaining;
+            remaining = 0;
+            withdrawalSource += ' + Bridge';
+          } else {
+            remaining -= bridgeBal;
+            bridgeBal = 0;
+            growthBal -= remaining;
+            withdrawalSource += ' + Bridge + Growth';
+          }
+        }
+      } else if (retirementYear < bucketConfig.cashTargetYears + bucketConfig.bridgeTargetYears) {
+        withdrawalPhase = `Retirement Years ${bucketConfig.cashTargetYears + 1}-${bucketConfig.cashTargetYears + bucketConfig.bridgeTargetYears}: Bridge`;
+        if (bridgeBal >= remaining) {
+          bridgeBal -= remaining;
+          remaining = 0;
+          withdrawalSource = 'Bucket 2 (Bridge)';
+        } else {
+          remaining -= bridgeBal;
+          bridgeBal = 0;
+          withdrawalSource = 'Bridge (Depleted)';
+          if (growthBal >= remaining) {
+            growthBal -= remaining;
+            remaining = 0;
+            withdrawalSource += ' + Growth';
+          } else {
+            growthBal -= remaining;
+            withdrawalSource += ' + Growth (Depleted)';
+          }
+        }
+      } else {
+        withdrawalPhase = `Retirement Year ${bucketConfig.cashTargetYears + bucketConfig.bridgeTargetYears + 1}+: Growth`;
+        if (growthBal >= remaining) {
+          growthBal -= remaining;
+          remaining = 0;
+          withdrawalSource = 'Bucket 3 (Growth)';
+        } else {
+          growthBal -= remaining;
+          withdrawalSource = 'Growth (Depleted!)';
+        }
+      }
+
+      cashBal = Math.max(0, cashBal) * (1 + cashReturn);
+      bridgeBal = Math.max(0, bridgeBal) * (1 + bridgeReturn);
+      growthBal = Math.max(0, growthBal) * (1 + growthReturn);
+
+      if (retirementYear >= bucketConfig.cashTargetYears && retirementYear < bucketConfig.cashTargetYears + bucketConfig.bridgeTargetYears) {
+        const targetCash = yearlySpending;
+        if (cashBal < targetCash && bridgeBal > targetCash * 2) {
+          const refill = targetCash - cashBal;
+          bridgeBal -= refill;
+          cashBal += refill;
+          action = action ? action + ' + Refill Cash' : 'Refill Cash from Bridge';
+        }
+      }
+    }
+
+    projections.push({
+      year,
+      age,
+      spendingNeed: yearlySpending,
+      income: yearlyIncome,
+      withdrawalNeeded,
+      taxOnWithdrawal,
+      grossWithdrawal,
+      startBalanceCash: startCash,
+      startBalanceBridge: startBridge,
+      startBalanceGrowth: startGrowth,
+      endBalanceCash: Math.max(0, cashBal),
+      endBalanceBridge: Math.max(0, bridgeBal),
+      endBalanceGrowth: Math.max(0, growthBal),
+      totalPortfolio: Math.max(0, cashBal) + Math.max(0, bridgeBal) + Math.max(0, growthBal),
+      withdrawalSource,
+      withdrawalPhase,
+      action,
+      ssIncome,
+      spouseSsIncome,
+      otherIncome: otherInc + spouseWorkIncome,
+      spouseWorkIncome,
+      rmdRequired,
+      rmdSatisfied,
+    });
+
+    age++;
+  }
+
+  return projections;
+}
+
+export interface SSComparison {
+  claimAge: number;
+  monthlyBenefit: number;
+  lifetimeTotal: number;
+  portfolioAtEnd: number;
+  depletionAge: number | null;
+}
+
+export function compareSSClaimingAges(
+  profile: UserProfile,
+  bucketConfig: BucketConfig,
+  currentHoldings: Holding[]
+): SSComparison[] {
+  const ages = [62, 64, 67, 70];
+  const baseAmount = profile.socialSecurityAmount;
+  const baseBenefitAge = 67;
+
+  return ages.map(claimAge => {
+    let factor: number;
+    if (claimAge < baseBenefitAge) {
+      const monthsEarly = (baseBenefitAge - claimAge) * 12;
+      factor = 1 - (monthsEarly <= 36 ? monthsEarly * 0.00556 : 36 * 0.00556 + (monthsEarly - 36) * 0.00417);
+    } else if (claimAge > baseBenefitAge) {
+      factor = 1 + (claimAge - baseBenefitAge) * 0.08;
+    } else {
+      factor = 1;
+    }
+    
+    const monthlyBenefit = Math.round(baseAmount * factor);
+    
+    const modifiedProfile = { ...profile, socialSecurityAge: claimAge, socialSecurityAmount: monthlyBenefit };
+    const projection = runProjection(modifiedProfile, bucketConfig, currentHoldings);
+    
+    const depletionYear = projection.find(d => d.totalPortfolio <= 0);
+    const finalBalance = projection[projection.length - 1]?.totalPortfolio || 0;
+    
+    const yearsReceiving = Math.max(0, profile.lifeExpectancy - claimAge);
+    const lifetimeTotal = monthlyBenefit * 12 * yearsReceiving;
+    
+    return {
+      claimAge,
+      monthlyBenefit,
+      lifetimeTotal,
+      portfolioAtEnd: finalBalance,
+      depletionAge: depletionYear ? depletionYear.age : null,
+    };
+  });
+}
+```
+
+### client/src/lib/engine.test.ts
+
+```ts
+/*
+ * Engine smoke tests — zero dependencies, run with:
+ *   npx tsx client/src/lib/engine.test.ts
+ *
+ * No framework on purpose: keeps this app's tooling identical to before.
+ * Promote to vitest once you have more than a handful of tests.
+ */
+
+import assert from 'node:assert/strict';
+import { runProjection } from './engine';
+import type { UserProfile, BucketConfig, Holding, TaxConfig } from './types';
+
+let passed = 0;
+let failed = 0;
+
+function test(name: string, fn: () => void) {
+  try {
+    fn();
+    passed++;
+    console.log(`  ok  ${name}`);
+  } catch (err) {
+    failed++;
+    console.error(`  FAIL  ${name}`);
+    console.error('    ', err instanceof Error ? err.message : err);
+  }
+}
+
+function approx(actual: number, expected: number, tol = 0.01, label = '') {
+  const diff = Math.abs(actual - expected);
+  if (diff > tol) {
+    throw new Error(`${label} expected ${expected.toFixed(4)} \u00b1 ${tol}, got ${actual.toFixed(4)} (diff ${diff.toFixed(4)})`);
+  }
+}
+
+const baseTax: TaxConfig = { federalRate: 22, stateRate: 5, capitalGainsRate: 15 };
+
+const baseProfile: UserProfile = {
+  currentAge: 56,
+  retirementAge: 56,
+  lifeExpectancy: 90,
+  monthlySpending: 8000,
+  inflationRate: 3,
+  socialSecurityAge: 67,
+  socialSecurityAmount: 2500,
+  spouseAge: 54,
+  spouseName: 'Angela',
+  spouseSocialSecurityAge: 67,
+  spouseSocialSecurityAmount: 1800,
+  spouseIncome: 0,
+  otherIncome: 0,
+  taxConfig: baseTax,
+};
+
+const baseConfig: BucketConfig = {
+  cashReturn: 4.5,
+  bridgeReturn: 6.5,
+  growthReturn: 8.5,
+  cashTargetYears: 3,
+  bridgeTargetYears: 7,
+  cashTarget: 288_000,
+  bridgeTarget: 672_000,
+  growthTarget: 1_384_000,
+  withdrawalRate: 4.25,
+};
+
+function makeHolding(bucket: 'cash' | 'bridge' | 'growth', dollars: number): Holding {
+  return {
+    id: `${bucket}-${dollars}`,
+    ticker: bucket.toUpperCase(),
+    name: bucket,
+    type: 'etf',
+    quantity: dollars,
+    currentPrice: 1,
+    lastUpdated: new Date().toISOString(),
+    accountId: 'acct-1',
+    bucket,
+  };
+}
+
+console.log('engine.ts tests');
+
+// ---------- Tax math ----------
+
+test('cash phase has 0% tax (no withholding on HYSA)', () => {
+  const holdings = [makeHolding('cash', 1_000_000)];
+  const proj = runProjection(baseProfile, baseConfig, holdings);
+  const yr1 = proj[0];
+  approx(yr1.taxOnWithdrawal, 0, 0.01, 'year-1 tax');
+  approx(yr1.grossWithdrawal, yr1.withdrawalNeeded, 0.01, 'year-1 gross');
+});
+
+test('growth phase grosses up CORRECTLY (gross = net / (1 - rate))', () => {
+  const holdings = [makeHolding('growth', 5_000_000)];
+  const proj = runProjection(baseProfile, baseConfig, holdings);
+  const growthYear = proj.find(y => y.withdrawalPhase.startsWith('Retirement Year') && y.withdrawalPhase.includes('Growth'));
+  assert.ok(growthYear, 'expected to reach growth phase');
+  // Combined rate = federalRate + stateRate = 27%. So gross = net / 0.73.
+  const expectedGross = growthYear!.withdrawalNeeded / (1 - 0.27);
+  approx(growthYear!.grossWithdrawal, expectedGross, 1, 'growth phase gross-up');
+  approx(growthYear!.taxOnWithdrawal, expectedGross - growthYear!.withdrawalNeeded, 1, 'growth phase tax');
+});
+
+test('bridge phase uses cap gains + state, not full income tax', () => {
+  const holdings = [makeHolding('bridge', 5_000_000)];
+  const proj = runProjection(baseProfile, baseConfig, holdings);
+  const bridgeYear = proj.find(y => y.withdrawalPhase.includes('Bridge') && y.withdrawalNeeded > 0);
+  assert.ok(bridgeYear, 'expected to reach bridge phase');
+  // Bridge effective rate = capGains + state = 20%. Gross = net / 0.80.
+  const expectedGross = bridgeYear!.withdrawalNeeded / (1 - 0.20);
+  approx(bridgeYear!.grossWithdrawal, expectedGross, 1, 'bridge phase gross-up');
+});
+
+test('federal + state are SUMMED, not averaged (regression for old bug)', () => {
+  const holdings = [makeHolding('growth', 5_000_000)];
+  const proj = runProjection(baseProfile, baseConfig, holdings);
+  const growthYear = proj.find(y => y.withdrawalPhase.includes('Growth') && y.withdrawalNeeded > 0);
+  assert.ok(growthYear, 'expected growth phase');
+  const avgRate = (22 + 5) / 2 / 100; // 13.5% \u2014 what the bug used
+  const buggyGross = growthYear!.withdrawalNeeded / (1 - avgRate);
+  assert.ok(
+    growthYear!.grossWithdrawal > buggyGross + 1,
+    `gross ${growthYear!.grossWithdrawal.toFixed(2)} should exceed buggy gross ${buggyGross.toFixed(2)}`,
+  );
+});
+
+// ---------- Projection invariants ----------
+
+test('total portfolio is monotonically non-increasing during retirement when no growth', () => {
+  const holdings = [makeHolding('cash', 100_000), makeHolding('bridge', 100_000), makeHolding('growth', 100_000)];
+  const config = { ...baseConfig, cashReturn: 0, bridgeReturn: 0, growthReturn: 0 };
+  const proj = runProjection(baseProfile, config, holdings);
+  for (let i = 1; i < proj.length; i++) {
+    assert.ok(
+      proj[i].totalPortfolio <= proj[i - 1].totalPortfolio + 0.5,
+      `year ${i}: portfolio went up without returns (${proj[i - 1].totalPortfolio} -> ${proj[i].totalPortfolio})`,
+    );
+  }
+});
+
+test('depletion is detected when funds run out', () => {
+  const holdings = [makeHolding('cash', 50_000)];
+  const tinyProfile: UserProfile = { ...baseProfile, monthlySpending: 5_000, socialSecurityAmount: 0, spouseSocialSecurityAmount: 0 };
+  const config = { ...baseConfig, cashReturn: 0, bridgeReturn: 0, growthReturn: 0 };
+  const proj = runProjection(tinyProfile, config, holdings);
+  const deplete = proj.find(y => y.totalPortfolio <= 0);
+  assert.ok(deplete, 'expected portfolio to deplete');
+});
+
+test('pre-retirement does not draw from buckets', () => {
+  const profile: UserProfile = { ...baseProfile, currentAge: 50, retirementAge: 65 };
+  const holdings = [makeHolding('cash', 100_000), makeHolding('growth', 500_000)];
+  const proj = runProjection(profile, baseConfig, holdings);
+  for (let i = 0; i < 15; i++) {
+    assert.equal(proj[i].withdrawalNeeded, 0, `year ${i} should have zero withdrawal pre-retirement`);
+    assert.equal(proj[i].grossWithdrawal, 0, `year ${i} should have zero gross pre-retirement`);
+  }
+});
+
+test('inflation grows spending year over year', () => {
+  const proj = runProjection(baseProfile, baseConfig, [makeHolding('cash', 1_000_000)]);
+  for (let i = 1; i < 10; i++) {
+    assert.ok(
+      proj[i].spendingNeed > proj[i - 1].spendingNeed,
+      `spending should grow with inflation (year ${i - 1}: ${proj[i - 1].spendingNeed}, year ${i}: ${proj[i].spendingNeed})`,
+    );
+  }
+});
+
+test('social security kicks in at the configured age', () => {
+  const proj = runProjection(baseProfile, baseConfig, [makeHolding('cash', 1_000_000)]);
+  const before = proj.find(y => y.age === 66);
+  const at = proj.find(y => y.age === 67);
+  assert.ok(before && at, 'need years 66 and 67');
+  assert.equal(before!.ssIncome, 0, 'SS should be 0 at 66');
+  assert.ok(at!.ssIncome > 0, 'SS should be positive at 67');
+});
+
+// ---------- Edge cases ----------
+
+test('handles empty holdings without crashing', () => {
+  const proj = runProjection(baseProfile, baseConfig, []);
+  assert.ok(proj.length > 0, 'should still produce projection rows');
+  assert.equal(proj[0].totalPortfolio, 0, 'first-year portfolio should be 0');
+});
+
+test('handles 100% tax config without dividing by zero', () => {
+  const profile: UserProfile = { ...baseProfile, taxConfig: { federalRate: 60, stateRate: 50, capitalGainsRate: 40 } };
+  const holdings = [makeHolding('growth', 5_000_000)];
+  const proj = runProjection(profile, baseConfig, holdings);
+  const growthYear = proj.find(y => y.withdrawalPhase.includes('Growth') && y.withdrawalNeeded > 0);
+  assert.ok(growthYear, 'expected growth phase');
+  assert.ok(Number.isFinite(growthYear!.grossWithdrawal), 'gross withdrawal must be finite');
+});
+
+console.log(`\n${passed} passed, ${failed} failed`);
+if (failed > 0) process.exit(1);
+```
+
+### client/src/lib/montecarlo.ts
+
+```ts
+/**
+ * Monte Carlo simulation for retirement portfolio outcomes.
+ *
+ * Runs many trials of the projection engine with returns drawn from a normal
+ * distribution. Reports success rate (portfolio > 0 at life expectancy) and
+ * percentile bands (5th / 50th / 95th) of total portfolio by year.
+ *
+ * Limitations:
+ *   - Returns are sampled independently each year (no autocorrelation, no fat tails).
+ *   - Inflation is treated as deterministic (worth making stochastic in a future round).
+ *   - Bucket returns are sampled independently (real markets are correlated; bonds
+ *     and stocks move together more than this assumes).
+ *
+ * Even with those simplifications, a stochastic model is dramatically more
+ * informative than a deterministic one for retirement planning.
+ */
+
+import { runProjection, YearProjection } from './engine';
+import type { UserProfile, BucketConfig, Holding, Account } from './types';
+
+/** Default annualized standard deviations — industry rough cuts. */
+export const DEFAULT_VOL = {
+  cash: 0.005,    // 0.5% — HYSA / MMF have near-zero vol
+  bridge: 0.08,   // 8% — 60/40 mix
+  growth: 0.16,   // 16% — broad equities
+};
+
+export interface MonteCarloOptions {
+  trials?: number;
+  cashVol?: number;
+  bridgeVol?: number;
+  growthVol?: number;
+  /** Seed for reproducible runs in tests. Omit for nondeterministic. */
+  seed?: number;
+}
+
+export interface MonteCarloResult {
+  trials: number;
+  /** Percent of trials where the portfolio survives to lifeExpectancy. */
+  successRate: number;
+  /** Worst, median, best final-balance trials. */
+  percentiles: {
+    p5: number;
+    p50: number;
+    p95: number;
+  };
+  /** For each year, percentile total portfolio across trials. */
+  byYear: Array<{
+    year: number;
+    age: number;
+    p5: number;
+    p25: number;
+    p50: number;
+    p75: number;
+    p95: number;
+  }>;
+  /** Trials in which the portfolio depleted before life expectancy. */
+  depletionAges: number[];
+}
+
+/** Tiny mulberry32 PRNG — deterministic when seeded. */
+function mulberry32(seed: number) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Box–Muller transform: turns two uniforms into one standard normal. */
+function gaussian(rand: () => number): number {
+  let u = 0, v = 0;
+  while (u === 0) u = rand();
+  while (v === 0) v = rand();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+function pct(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+  return sorted[idx];
+}
+
+export function runMonteCarlo(
+  profile: UserProfile,
+  bucketConfig: BucketConfig,
+  holdings: Holding[],
+  accounts: Account[] | undefined,
+  opts: MonteCarloOptions = {},
+): MonteCarloResult {
+  const trials = opts.trials ?? 1000;
+  const cashVol = opts.cashVol ?? DEFAULT_VOL.cash;
+  const bridgeVol = opts.bridgeVol ?? DEFAULT_VOL.bridge;
+  const growthVol = opts.growthVol ?? DEFAULT_VOL.growth;
+  const rand = opts.seed != null ? mulberry32(opts.seed) : Math.random;
+
+  const yearsToProject = profile.lifeExpectancy - profile.currentAge + 1;
+  const cashMu = bucketConfig.cashReturn / 100;
+  const bridgeMu = bucketConfig.bridgeReturn / 100;
+  const growthMu = bucketConfig.growthReturn / 100;
+
+  // Per-year arrays: [year][trial] = total portfolio
+  const portfolioByYear: number[][] = Array.from({ length: yearsToProject }, () => []);
+  const finalBalances: number[] = [];
+  const depletionAges: number[] = [];
+  let successes = 0;
+
+  for (let t = 0; t < trials; t++) {
+    const cash = new Array(yearsToProject);
+    const bridge = new Array(yearsToProject);
+    const growth = new Array(yearsToProject);
+    for (let y = 0; y < yearsToProject; y++) {
+      cash[y] = cashMu + cashVol * gaussian(rand);
+      bridge[y] = bridgeMu + bridgeVol * gaussian(rand);
+      growth[y] = growthMu + growthVol * gaussian(rand);
+    }
+
+    const proj = runProjection(profile, bucketConfig, holdings, {
+      accounts,
+      returnOverrides: { cash, bridge, growth },
+    });
+
+    proj.forEach((row, idx) => portfolioByYear[idx]?.push(row.totalPortfolio));
+
+    const final = proj[proj.length - 1]?.totalPortfolio ?? 0;
+    finalBalances.push(final);
+
+    const depletion = proj.find(r => r.totalPortfolio <= 0);
+    if (depletion) depletionAges.push(depletion.age);
+
+    if (final > 0) successes++;
+  }
+
+  finalBalances.sort((a, b) => a - b);
+  const byYear = portfolioByYear.map((vals, idx) => {
+    const sorted = [...vals].sort((a, b) => a - b);
+    return {
+      year: new Date().getFullYear() + idx,
+      age: profile.currentAge + idx,
+      p5: pct(sorted, 0.05),
+      p25: pct(sorted, 0.25),
+      p50: pct(sorted, 0.50),
+      p75: pct(sorted, 0.75),
+      p95: pct(sorted, 0.95),
+    };
+  });
+
+  return {
+    trials,
+    successRate: trials > 0 ? successes / trials : 0,
+    percentiles: {
+      p5: pct(finalBalances, 0.05),
+      p50: pct(finalBalances, 0.50),
+      p95: pct(finalBalances, 0.95),
+    },
+    byYear,
+    depletionAges,
+  };
+}
+
+/** Helper for the dashboard. Smaller trial count for snappy dashboard refresh. */
+export function quickSuccessProbability(
+  profile: UserProfile,
+  bucketConfig: BucketConfig,
+  holdings: Holding[],
+  accounts?: Account[],
+): number {
+  return runMonteCarlo(profile, bucketConfig, holdings, accounts, { trials: 250 }).successRate;
+}
+
+// runProjection's YearProjection is re-exported for ease of use by callers.
+export type { YearProjection };
+```
+
+### client/src/lib/montecarlo.test.ts
+
+```ts
+/*
+ * Monte Carlo + account-aware tax + RMD tests.
+ * Run with: npx tsx client/src/lib/montecarlo.test.ts
+ */
+
+import assert from 'node:assert/strict';
+import { runProjection } from './engine';
+import { runMonteCarlo, DEFAULT_VOL } from './montecarlo';
+import { calculateRMD, isRMDAge, RMD_START_AGE } from './rmd';
+import type { UserProfile, BucketConfig, Holding, Account, AccountType } from './types';
+
+let passed = 0;
+let failed = 0;
+
+function test(name: string, fn: () => void) {
+  try {
+    fn();
+    passed++;
+    console.log(`  ok  ${name}`);
+  } catch (err) {
+    failed++;
+    console.error(`  FAIL  ${name}`);
+    console.error('    ', err instanceof Error ? err.message : err);
+  }
+}
+
+const baseProfile: UserProfile = {
+  currentAge: 56,
+  retirementAge: 56,
+  lifeExpectancy: 90,
+  monthlySpending: 8000,
+  inflationRate: 3,
+  socialSecurityAge: 67,
+  socialSecurityAmount: 2500,
+  spouseAge: 54,
+  spouseName: 'Angela',
+  spouseSocialSecurityAge: 67,
+  spouseSocialSecurityAmount: 1800,
+  spouseIncome: 0,
+  otherIncome: 0,
+  taxConfig: { federalRate: 22, stateRate: 5, capitalGainsRate: 15 },
+};
+
+const baseConfig: BucketConfig = {
+  cashReturn: 4.5, bridgeReturn: 6.5, growthReturn: 8.5,
+  cashTargetYears: 3, bridgeTargetYears: 7,
+  cashTarget: 288_000, bridgeTarget: 672_000, growthTarget: 1_384_000,
+  withdrawalRate: 4.25,
+};
+
+function makeHolding(bucket: 'cash' | 'bridge' | 'growth', dollars: number, accountId = 'acct-1'): Holding {
+  return {
+    id: `${bucket}-${dollars}-${accountId}`,
+    ticker: bucket.toUpperCase(),
+    name: bucket,
+    type: 'etf',
+    quantity: dollars,
+    currentPrice: 1,
+    lastUpdated: new Date().toISOString(),
+    accountId,
+    bucket,
+  };
+}
+
+function makeAccount(id: string, type: AccountType): Account {
+  return { id, name: `${type}-${id}`, type };
+}
+
+console.log('Round 3 tests (Monte Carlo + Account Tax + RMD)\n');
+
+// ============================================================================
+// RMD math
+// ============================================================================
+console.log('  -- RMD --');
+
+test('RMD is 0 below age 73', () => {
+  for (let age = 60; age < RMD_START_AGE; age++) {
+    assert.equal(calculateRMD(1_000_000, age), 0, `age ${age} should have no RMD`);
+  }
+});
+
+test('RMD at 73 uses divisor 26.5', () => {
+  // Per IRS Uniform Lifetime Table.
+  const expected = 1_000_000 / 26.5;
+  const actual = calculateRMD(1_000_000, 73);
+  assert.ok(Math.abs(actual - expected) < 0.01, `expected ~${expected.toFixed(2)}, got ${actual.toFixed(2)}`);
+});
+
+test('RMD at 80 uses divisor 20.2', () => {
+  const expected = 1_000_000 / 20.2;
+  const actual = calculateRMD(1_000_000, 80);
+  assert.ok(Math.abs(actual - expected) < 0.01);
+});
+
+test('RMD increases as a percentage with age', () => {
+  // Sanity: RMD/balance should be monotonically increasing.
+  let prev = 0;
+  for (let age = 73; age <= 95; age++) {
+    const rmd = calculateRMD(1_000_000, age);
+    assert.ok(rmd > prev, `age ${age}: ${rmd} should exceed age ${age - 1}: ${prev}`);
+    prev = rmd;
+  }
+});
+
+test('isRMDAge boundary', () => {
+  assert.equal(isRMDAge(72), false);
+  assert.equal(isRMDAge(73), true);
+  assert.equal(isRMDAge(100), true);
+});
+
+test('RMD with zero balance is zero', () => {
+  assert.equal(calculateRMD(0, 80), 0);
+  assert.equal(calculateRMD(-100, 80), 0);
+});
+
+// ============================================================================
+// Account-aware tax model
+// ============================================================================
+console.log('\n  -- Account-aware tax --');
+
+test('Roth IRA in growth bucket pays 0% tax', () => {
+  const accounts = [makeAccount('roth', 'roth_ira')];
+  const holdings = [makeHolding('growth', 5_000_000, 'roth')];
+  const proj = runProjection(baseProfile, baseConfig, holdings, { accounts });
+  const growthYr = proj.find(y => y.withdrawalPhase.includes('Growth') && y.withdrawalNeeded > 0);
+  assert.ok(growthYr, 'expected growth phase');
+  // With 100% Roth, gross should equal net (no tax).
+  assert.ok(Math.abs(growthYr.grossWithdrawal - growthYr.withdrawalNeeded) < 1, 'Roth should have ~0% effective tax');
+  assert.ok(growthYr.taxOnWithdrawal < 1, 'Tax should be ~0');
+});
+
+test('Traditional IRA in growth bucket pays full ordinary income', () => {
+  const accounts = [makeAccount('trad', 'traditional_ira')];
+  const holdings = [makeHolding('growth', 5_000_000, 'trad')];
+  const proj = runProjection(baseProfile, baseConfig, holdings, { accounts });
+  const growthYr = proj.find(y => y.withdrawalPhase.includes('Growth') && y.withdrawalNeeded > 0);
+  assert.ok(growthYr, 'expected growth phase');
+  // 22% federal + 5% state = 27%; gross = net / 0.73
+  const expectedGross = growthYr.withdrawalNeeded / 0.73;
+  assert.ok(Math.abs(growthYr.grossWithdrawal - expectedGross) < 5, `expected ~${expectedGross}, got ${growthYr.grossWithdrawal}`);
+});
+
+test('50/50 Roth/Traditional gives roughly half the tax', () => {
+  const accounts = [makeAccount('roth', 'roth_ira'), makeAccount('trad', 'traditional_ira')];
+  const holdings = [
+    makeHolding('growth', 2_500_000, 'roth'),
+    makeHolding('growth', 2_500_000, 'trad'),
+  ];
+  const proj = runProjection(baseProfile, baseConfig, holdings, { accounts });
+  const growthYr = proj.find(y => y.withdrawalPhase.includes('Growth') && y.withdrawalNeeded > 0);
+  assert.ok(growthYr, 'expected growth phase');
+  // Effective rate ~13.5% (half of 27%)
+  const expectedGross = growthYr.withdrawalNeeded / (1 - 0.135);
+  assert.ok(Math.abs(growthYr.grossWithdrawal - expectedGross) < 10, `mixed tax: expected ~${expectedGross}, got ${growthYr.grossWithdrawal}`);
+});
+
+test('No accounts param falls back to legacy behavior', () => {
+  // Same holdings, no accounts → legacy fed+state for growth phase.
+  const holdings = [makeHolding('growth', 5_000_000)];
+  const proj = runProjection(baseProfile, baseConfig, holdings);
+  const growthYr = proj.find(y => y.withdrawalPhase.includes('Growth') && y.withdrawalNeeded > 0);
+  assert.ok(growthYr, 'expected growth phase');
+  const expectedGross = growthYr.withdrawalNeeded / 0.73;
+  assert.ok(Math.abs(growthYr.grossWithdrawal - expectedGross) < 5);
+});
+
+// ============================================================================
+// Monte Carlo
+// ============================================================================
+console.log('\n  -- Monte Carlo --');
+
+test('success rate is between 0 and 1', () => {
+  const holdings = [makeHolding('cash', 200_000), makeHolding('bridge', 600_000), makeHolding('growth', 1_500_000)];
+  const result = runMonteCarlo(baseProfile, baseConfig, holdings, [], { trials: 100, seed: 42 });
+  assert.ok(result.successRate >= 0 && result.successRate <= 1, `successRate=${result.successRate}`);
+});
+
+test('percentiles are ordered: p5 <= p50 <= p95', () => {
+  const holdings = [makeHolding('cash', 200_000), makeHolding('bridge', 600_000), makeHolding('growth', 1_500_000)];
+  const result = runMonteCarlo(baseProfile, baseConfig, holdings, [], { trials: 200, seed: 42 });
+  assert.ok(result.percentiles.p5 <= result.percentiles.p50, `p5 ${result.percentiles.p5} > p50 ${result.percentiles.p50}`);
+  assert.ok(result.percentiles.p50 <= result.percentiles.p95, `p50 > p95`);
+  // Same for any year band
+  for (const yr of result.byYear) {
+    assert.ok(yr.p5 <= yr.p25 && yr.p25 <= yr.p50 && yr.p50 <= yr.p75 && yr.p75 <= yr.p95,
+      `year ${yr.year} percentiles out of order`);
+  }
+});
+
+test('seed produces deterministic results', () => {
+  const holdings = [makeHolding('growth', 1_000_000)];
+  const a = runMonteCarlo(baseProfile, baseConfig, holdings, [], { trials: 100, seed: 7 });
+  const b = runMonteCarlo(baseProfile, baseConfig, holdings, [], { trials: 100, seed: 7 });
+  assert.equal(a.successRate, b.successRate, 'seeded MC should reproduce');
+  assert.equal(a.percentiles.p50, b.percentiles.p50);
+});
+
+test('higher portfolio = higher success rate (sanity)', () => {
+  const small = [makeHolding('cash', 100_000)];
+  const large = [makeHolding('cash', 200_000), makeHolding('bridge', 600_000), makeHolding('growth', 1_500_000)];
+  const r1 = runMonteCarlo(baseProfile, baseConfig, small, [], { trials: 200, seed: 1 });
+  const r2 = runMonteCarlo(baseProfile, baseConfig, large, [], { trials: 200, seed: 1 });
+  assert.ok(r2.successRate > r1.successRate,
+    `bigger portfolio should beat smaller (${r1.successRate} vs ${r2.successRate})`);
+});
+
+test('zero volatility approximates deterministic projection', () => {
+  // With vol=0, MC should produce ~identical paths to the deterministic engine.
+  const holdings = [makeHolding('cash', 200_000), makeHolding('bridge', 600_000), makeHolding('growth', 1_500_000)];
+  const det = runProjection(baseProfile, baseConfig, holdings);
+  const detFinal = det[det.length - 1].totalPortfolio;
+  const result = runMonteCarlo(baseProfile, baseConfig, holdings, [], {
+    trials: 50, seed: 1, cashVol: 0, bridgeVol: 0, growthVol: 0,
+  });
+  // Median should match deterministic within 1%.
+  const diff = Math.abs(result.percentiles.p50 - detFinal) / Math.max(1, detFinal);
+  assert.ok(diff < 0.01, `MC median (${result.percentiles.p50}) should match deterministic (${detFinal}); diff ${(diff*100).toFixed(2)}%`);
+});
+
+test('byYear array has one entry per projected year', () => {
+  const holdings = [makeHolding('cash', 1_000_000)];
+  const result = runMonteCarlo(baseProfile, baseConfig, holdings, [], { trials: 50, seed: 1 });
+  const expectedYears = baseProfile.lifeExpectancy - baseProfile.currentAge + 1;
+  assert.equal(result.byYear.length, expectedYears, `expected ${expectedYears} years, got ${result.byYear.length}`);
+});
+
+test('default volatilities are sensible', () => {
+  assert.ok(DEFAULT_VOL.cash < DEFAULT_VOL.bridge, 'cash should be less volatile than bridge');
+  assert.ok(DEFAULT_VOL.bridge < DEFAULT_VOL.growth, 'bridge should be less volatile than growth');
+});
+
+// ============================================================================
+// Integration: RMD via projection
+// ============================================================================
+console.log('\n  -- Integration --');
+
+test('projection records rmdRequired at age 73+', () => {
+  // Use older profile so we hit RMD years quickly.
+  const oldProfile: UserProfile = { ...baseProfile, currentAge: 70, retirementAge: 70, lifeExpectancy: 85 };
+  const accounts = [makeAccount('trad', 'traditional_ira')];
+  const holdings = [makeHolding('growth', 2_000_000, 'trad')];
+  const proj = runProjection(oldProfile, baseConfig, holdings, { accounts });
+  const at73 = proj.find(y => y.age === 73);
+  const at72 = proj.find(y => y.age === 72);
+  assert.ok(at73, 'need year at 73');
+  assert.ok(at72, 'need year at 72');
+  assert.equal(at72.rmdRequired, 0, 'no RMD at 72');
+  assert.ok(at73.rmdRequired > 0, `expected positive RMD at 73, got ${at73.rmdRequired}`);
+});
+
+console.log(`\n${passed} passed, ${failed} failed`);
+if (failed > 0) process.exit(1);
+```
+
+### client/src/components/Logo.tsx
+
+```tsx
+import { cn } from '@/lib/utils';
+
+/**
+ * Brand mark: three stacked rounded rectangles representing the cash / bridge / growth buckets.
+ * Inline SVG so it inherits color via CSS and works on both light and dark backgrounds.
+ */
+export function Logo({ className, size = 28 }: { className?: string; size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 64 64"
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      role="img"
+      aria-label="3-Bucket Plan"
+      className={cn('shrink-0', className)}
+    >
+      <rect x="22" y="8"  width="20" height="12" rx="3" fill="currentColor" opacity="0.55" />
+      <rect x="14" y="24" width="36" height="14" rx="3" fill="currentColor" opacity="0.78" />
+      <rect x="6"  y="42" width="52" height="16" rx="3" fill="currentColor" />
+    </svg>
+  );
+}
+```
+
+### client/src/components/Layout.tsx
+
+```tsx
+import React from 'react';
+import { Link, useLocation } from 'wouter';
+import { LayoutDashboard, Wallet, PieChart, TrendingUp, Settings, FileText } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { useStore } from '@/lib/store';
+import { Logo } from '@/components/Logo';
+
+export function Layout({ children }: { children: React.ReactNode }) {
+  const [location] = useLocation();
+  const { scenarios, activeScenarioId } = useStore();
+  const activeScenario = scenarios.find(s => s.id === activeScenarioId);
+
+  const navItems = [
+    { href: '/', label: 'Home', icon: LayoutDashboard },
+    { href: '/holdings', label: 'Holdings', icon: Wallet },
+    { href: '/buckets', label: 'Buckets', icon: PieChart },
+    { href: '/projection', label: 'Plan', icon: TrendingUp },
+    { href: '/scenarios', label: 'Settings', icon: Settings },
+    { href: '/report', label: 'Report', icon: FileText, desktopOnly: true },
+  ] as const;
+
+  return (
+    <div className="min-h-screen bg-background flex font-sans text-foreground">
+      {/* Desktop Sidebar */}
+      <aside className="w-64 bg-sidebar border-r border-sidebar-border hidden md:flex flex-col fixed h-full z-10">
+        <div className="p-5 border-b border-sidebar-border/50">
+          <Link href="/" className="flex items-center gap-3 group">
+            <Logo size={32} className="text-primary transition-transform group-hover:scale-105" />
+            <div className="flex flex-col leading-tight">
+              <span className="text-base font-serif font-bold text-sidebar-primary-foreground tracking-tight">
+                3-Bucket Plan
+              </span>
+              <span className="text-[10px] uppercase tracking-[0.12em] text-sidebar-foreground/50 font-medium">
+                Retirement Planner
+              </span>
+            </div>
+          </Link>
+          {activeScenario && (
+            <div className="mt-4 px-2.5 py-1.5 rounded-md bg-sidebar-accent/40 border border-sidebar-border/40">
+              <p className="text-[10px] uppercase tracking-wider text-sidebar-foreground/50 font-medium">Active Scenario</p>
+              <p className="text-xs text-sidebar-foreground font-medium truncate" title={activeScenario.name}>
+                {activeScenario.name}
+              </p>
+            </div>
+          )}
+        </div>
+
+        <nav className="flex-1 p-3 space-y-0.5">
+          {navItems.map((item) => {
+            const isActive = location === item.href;
+            return (
+              <Link key={item.href} href={item.href} className={cn(
+                "flex items-center gap-3 px-3 py-2.5 rounded-md text-sm font-medium transition-all duration-200",
+                isActive
+                  ? "bg-sidebar-accent text-sidebar-accent-foreground shadow-sm"
+                  : "text-sidebar-foreground/70 hover:text-sidebar-foreground hover:bg-sidebar-accent/50"
+              )}>
+                <item.icon size={18} strokeWidth={isActive ? 2.25 : 1.75} />
+                {item.label}
+              </Link>
+            );
+          })}
+        </nav>
+
+        <div className="p-4 border-t border-sidebar-border/50">
+          <div className="rounded-lg p-3 text-[11px] leading-relaxed text-sidebar-foreground/60">
+            <p className="font-semibold mb-1 text-sidebar-foreground/80">Educational use only</p>
+            Projections are estimates, not financial advice.
+          </div>
+        </div>
+      </aside>
+
+      {/* Mobile Header */}
+      <header className="md:hidden fixed top-0 left-0 right-0 bg-background/95 backdrop-blur border-b border-border z-50 safe-area-inset-top">
+        <div className="flex items-center justify-center h-14 px-4">
+          <Link href="/" className="flex items-center gap-2">
+            <Logo size={22} className="text-primary" />
+            <h1 className="text-base font-serif font-bold text-foreground">
+              3-Bucket Plan
+            </h1>
+          </Link>
+        </div>
+      </header>
+
+      {/* Mobile Bottom Navigation */}
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-background/95 backdrop-blur border-t border-border z-50 pb-safe">
+        <div className="flex justify-around items-center h-16 px-2">
+          {navItems.filter(item => !('desktopOnly' in item && item.desktopOnly)).map((item) => {
+            const isActive = location === item.href;
+            const Icon = item.icon;
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                className={cn(
+                  'flex flex-col items-center justify-center min-w-[60px] py-2 rounded-lg transition-colors',
+                  isActive
+                    ? 'text-primary'
+                    : 'text-muted-foreground active:text-foreground'
+                )}
+                data-testid={`nav-${item.label.toLowerCase()}`}
+              >
+                <Icon size={22} strokeWidth={isActive ? 2.5 : 2} />
+                <span className="text-[10px] mt-1 font-medium">{item.label}</span>
+              </Link>
+            );
+          })}
+        </div>
+      </nav>
+
+      {/* Main Content */}
+      <main className="flex-1 md:ml-64 bg-background min-h-screen pt-16 pb-20 md:pt-0 md:pb-0">
+        <div className="max-w-7xl mx-auto p-4 md:p-8 space-y-6 md:space-y-8 animate-in fade-in duration-500">
+          {children}
+        </div>
+      </main>
+    </div>
+  );
+}
+```
+
+### client/src/components/ProjectionChart.tsx
+
+```tsx
+import { useMemo } from 'react';
+import { useStore } from '@/lib/store';
+import { runProjection, compareSSClaimingAges } from '@/lib/engine';
+import { runMonteCarlo } from '@/lib/montecarlo';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area, ComposedChart, Line, ReferenceLine } from 'recharts';
+import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/components/ui/card';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { CalendarClock, TrendingUp, Activity } from 'lucide-react';
+
+export function ProjectionChart() {
+  const { activeScenarioId, scenarios, holdings, accounts } = useStore();
+  const scenario = scenarios.find(s => s.id === activeScenarioId);
+
+  const data = useMemo(() => {
+    if (!scenario) return [];
+    return runProjection(scenario.profile, scenario.bucketConfig, holdings, { accounts });
+  }, [scenario, holdings, accounts]);
+
+  const ssComparison = useMemo(() => {
+    if (!scenario) return [];
+    return compareSSClaimingAges(scenario.profile, scenario.bucketConfig, holdings);
+  }, [scenario, holdings]);
+
+  // Full Monte Carlo: 1000 trials. Seeded so the chart is stable across renders;
+  // remove the seed if you'd rather see fresh stochastic draws on each visit.
+  const monteCarlo = useMemo(() => {
+    if (!scenario || holdings.length === 0) return null;
+    return runMonteCarlo(scenario.profile, scenario.bucketConfig, holdings, accounts, { trials: 1000, seed: 42 });
+  }, [scenario, holdings, accounts]);
+
+  if (!scenario || data.length === 0) return <div className="text-muted-foreground text-sm p-4">No data to project</div>;
+
+  const depletionYear = data.find(d => d.totalPortfolio <= 0);
+  const finalBalance = data[data.length - 1]?.totalPortfolio || 0;
+  const ssStartAge = scenario.profile.socialSecurityAge;
+  const spouseSsStartAge = scenario.profile.spouseSocialSecurityAge;
+  const retirementAge = scenario.profile.retirementAge ?? scenario.profile.currentAge;
+  const cashEndAge = retirementAge + scenario.bucketConfig.cashTargetYears;
+  const bridgeEndAge = cashEndAge + scenario.bucketConfig.bridgeTargetYears;
+
+  const incomeBreakdown = data.map(d => ({
+    age: d.age,
+    'Social Security': d.ssIncome,
+    'Spouse SS': d.spouseSsIncome,
+    'Other Income': d.otherIncome,
+    'Portfolio Withdrawal': d.withdrawalNeeded,
+    'Tax on Withdrawal': d.taxOnWithdrawal,
+    'Spending Need': d.spendingNeed,
+  }));
+
+  return (
+    <div className="space-y-8">
+      {depletionYear && (
+        <Card className="border-destructive bg-destructive/5" data-testid="card-depletion-warning">
+          <CardContent className="p-4">
+            <p className="text-sm font-semibold text-destructive">
+              Deterministic projection depletes at age {depletionYear.age} ({depletionYear.year}). See the stress test below for the range of outcomes.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      <ErrorBoundary fallbackTitle="Stress Test Error">
+        {monteCarlo && (() => {
+          const pct = Math.round(monteCarlo.successRate * 100);
+          const tone = pct >= 85 ? 'primary' : pct >= 70 ? 'amber' : 'destructive';
+          const fanData = monteCarlo.byYear.map(d => ({
+            age: d.age,
+            p5: Math.max(0, d.p5),
+            p25: Math.max(0, d.p25),
+            p50: Math.max(0, d.p50),
+            p75: Math.max(0, d.p75),
+            p95: Math.max(0, d.p95),
+            // For stacked area: p5 is the floor, then differences between bands
+            band5_25: Math.max(0, d.p25 - d.p5),
+            band25_50: Math.max(0, d.p50 - d.p25),
+            band50_75: Math.max(0, d.p75 - d.p50),
+            band75_95: Math.max(0, d.p95 - d.p75),
+          }));
+          const medianDepletion = monteCarlo.depletionAges.length > 0
+            ? Math.round(monteCarlo.depletionAges.slice().sort((a, b) => a - b)[Math.floor(monteCarlo.depletionAges.length / 2)])
+            : null;
+          return (
+            <Card data-testid="card-monte-carlo">
+              <CardHeader>
+                <CardTitle className="font-serif flex items-center gap-2">
+                  <Activity size={18} /> Stress Test (1,000 simulations)
+                </CardTitle>
+                <CardDescription>
+                  Returns sampled from a normal distribution year by year. Bands show the range of portfolio outcomes — darker = more likely.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                  <div className={`p-3 rounded-lg ${
+                    tone === 'primary' ? 'bg-primary/10 border border-primary/30'
+                    : tone === 'amber' ? 'bg-amber-500/10 border border-amber-500/30'
+                    : 'bg-destructive/10 border border-destructive/30'}`}>
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Success Rate</p>
+                    <p className={`text-2xl font-mono font-bold ${
+                      tone === 'primary' ? 'text-primary'
+                      : tone === 'amber' ? 'text-amber-700 dark:text-amber-500'
+                      : 'text-destructive'}`}>{pct}%</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">Survives to age {scenario.profile.lifeExpectancy}</p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-muted/30 border border-border">
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Median Final</p>
+                    <p className="text-2xl font-mono font-bold">${Math.round(monteCarlo.percentiles.p50/1000).toLocaleString()}K</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">50th percentile</p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-muted/30 border border-border">
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Worst Case (5%)</p>
+                    <p className="text-2xl font-mono font-bold">${Math.round(Math.max(0, monteCarlo.percentiles.p5)/1000).toLocaleString()}K</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">5th percentile</p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-muted/30 border border-border">
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Median Depletion</p>
+                    <p className="text-2xl font-mono font-bold">{medianDepletion ? `Age ${medianDepletion}` : 'None'}</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">In {monteCarlo.depletionAges.length} of 1000 trials</p>
+                  </div>
+                </div>
+                <div className="h-[280px] md:h-[360px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={fanData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                      <XAxis dataKey="age" tick={{ fontSize: 11 }} />
+                      <YAxis tickFormatter={(v) => v >= 1000000 ? `${(v/1000000).toFixed(1)}M` : `${Math.round(v/1000)}k`} tick={{ fontSize: 11 }} width={45} />
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                      <Tooltip
+                        formatter={(_value: number, name: string, item: any) => {
+                          // Show actual percentile values on hover, not the band deltas
+                          const d = item?.payload;
+                          if (!d) return ['', name];
+                          const map: Record<string, [string, number]> = {
+                            'Floor (p5)': ['p5', d.p5],
+                            'p5–p25 band': ['p25', d.p25],
+                            'p25–p50 band': ['p50 (median)', d.p50],
+                            'p50–p75 band': ['p75', d.p75],
+                            'p75–p95 band': ['p95', d.p95],
+                          };
+                          const [label, val] = map[name] ?? [name, _value];
+                          return [`$${Math.round(val).toLocaleString()}`, label];
+                        }}
+                        labelFormatter={(age) => `Age ${age}`}
+                      />
+                      <Area type="monotone" dataKey="p5" stackId="fan" stroke="none" fill="transparent" name="Floor (p5)" />
+                      <Area type="monotone" dataKey="band5_25" stackId="fan" stroke="none" fill="hsl(var(--primary))" fillOpacity={0.15} name="p5–p25 band" />
+                      <Area type="monotone" dataKey="band25_50" stackId="fan" stroke="none" fill="hsl(var(--primary))" fillOpacity={0.30} name="p25–p50 band" />
+                      <Area type="monotone" dataKey="band50_75" stackId="fan" stroke="none" fill="hsl(var(--primary))" fillOpacity={0.30} name="p50–p75 band" />
+                      <Area type="monotone" dataKey="band75_95" stackId="fan" stroke="none" fill="hsl(var(--primary))" fillOpacity={0.15} name="p75–p95 band" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+                <p className="text-[11px] text-muted-foreground mt-2 leading-relaxed">
+                  Darker band = middle 50% of outcomes. Lighter wings = the worst and best 25%. The deterministic chart below shows one scenario; this shows the range.
+                </p>
+              </CardContent>
+            </Card>
+          );
+        })()}
+      </ErrorBoundary>
+
+      <ErrorBoundary fallbackTitle="Chart Error">
+        <Card>
+          <CardHeader>
+            <CardTitle className="font-serif">Portfolio Balance Projection</CardTitle>
+            <CardDescription>Stacked by bucket with milestone markers</CardDescription>
+          </CardHeader>
+          <CardContent className="h-[280px] md:h-[400px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={data} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="colorGrowth" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="hsl(var(--chart-1))" stopOpacity={0.8}/>
+                    <stop offset="95%" stopColor="hsl(var(--chart-1))" stopOpacity={0}/>
+                  </linearGradient>
+                  <linearGradient id="colorBridge" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="hsl(var(--chart-2))" stopOpacity={0.8}/>
+                    <stop offset="95%" stopColor="hsl(var(--chart-2))" stopOpacity={0}/>
+                  </linearGradient>
+                  <linearGradient id="colorCash" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="hsl(var(--chart-3))" stopOpacity={0.8}/>
+                    <stop offset="95%" stopColor="hsl(var(--chart-3))" stopOpacity={0}/>
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey="age" tick={{ fontSize: 11 }} />
+                <YAxis tickFormatter={(val) => val >= 1000000 ? `${(val/1000000).toFixed(1)}M` : `${Math.round(val/1000)}k`} tick={{ fontSize: 11 }} width={45} />
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <Tooltip formatter={(value: number) => `$${Math.round(value).toLocaleString()}`} />
+                <Legend />
+                {retirementAge > scenario.profile.currentAge && (
+                  <ReferenceLine x={retirementAge} stroke="hsl(var(--foreground))" strokeDasharray="4 4" label={{ value: 'Retire', position: 'top', fontSize: 9 }} />
+                )}
+                <ReferenceLine x={cashEndAge} stroke="hsl(var(--chart-3))" strokeDasharray="5 5" label={{ value: 'Cash ends', position: 'top', fontSize: 9 }} />
+                <ReferenceLine x={bridgeEndAge} stroke="hsl(var(--chart-2))" strokeDasharray="5 5" label={{ value: 'Bridge ends', position: 'top', fontSize: 9 }} />
+                {ssStartAge <= scenario.profile.lifeExpectancy && (
+                  <ReferenceLine x={ssStartAge} stroke="hsl(var(--primary))" strokeDasharray="3 3" label={{ value: 'SS starts', position: 'insideTopRight', fontSize: 9 }} />
+                )}
+                <Area type="monotone" dataKey="endBalanceGrowth" stackId="1" stroke="hsl(var(--chart-1))" fill="url(#colorGrowth)" name="B3: Growth" />
+                <Area type="monotone" dataKey="endBalanceBridge" stackId="1" stroke="hsl(var(--chart-2))" fill="url(#colorBridge)" name="B2: Bridge" />
+                <Area type="monotone" dataKey="endBalanceCash" stackId="1" stroke="hsl(var(--chart-3))" fill="url(#colorCash)" name="B1: Cash" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      </ErrorBoundary>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <ErrorBoundary fallbackTitle="Income Chart Error">
+          <Card>
+            <CardHeader>
+              <CardTitle className="font-serif text-lg">Income Breakdown</CardTitle>
+              <CardDescription>Where your income comes from each year</CardDescription>
+            </CardHeader>
+            <CardContent className="h-[250px] md:h-[300px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={incomeBreakdown}>
+                  <XAxis dataKey="age" tick={{ fontSize: 11 }} />
+                  <YAxis tickFormatter={(val) => val >= 1000000 ? `${(val/1000000).toFixed(1)}M` : `${Math.round(val/1000)}k`} tick={{ fontSize: 11 }} width={45} />
+                  <Tooltip formatter={(value: number) => `$${Math.round(value).toLocaleString()}`} />
+                  <Legend />
+                  <Area type="monotone" dataKey="Portfolio Withdrawal" stackId="1" stroke="hsl(var(--sidebar-accent))" fill="hsl(var(--sidebar-accent))" fillOpacity={0.6} />
+                  <Area type="monotone" dataKey="Social Security" stackId="1" stroke="hsl(var(--primary))" fill="hsl(var(--primary))" fillOpacity={0.4} />
+                  <Area type="monotone" dataKey="Spouse SS" stackId="1" stroke="hsl(var(--chart-4))" fill="hsl(var(--chart-4))" fillOpacity={0.4} />
+                  <Area type="monotone" dataKey="Other Income" stackId="1" stroke="hsl(var(--chart-5))" fill="hsl(var(--chart-5))" fillOpacity={0.4} />
+                  <Line type="monotone" dataKey="Spending Need" stroke="hsl(var(--destructive))" strokeWidth={2} dot={false} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+        </ErrorBoundary>
+
+        <ErrorBoundary fallbackTitle="Withdrawal Chart Error">
+          <Card>
+            <CardHeader>
+              <CardTitle className="font-serif text-lg">Withdrawal Sequence</CardTitle>
+              <CardDescription>Amount drawn from portfolio + tax impact</CardDescription>
+            </CardHeader>
+            <CardContent className="h-[250px] md:h-[300px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={data}>
+                  <XAxis dataKey="age" tick={{ fontSize: 11 }} />
+                  <YAxis tickFormatter={(val) => val >= 1000000 ? `${(val/1000000).toFixed(1)}M` : `${Math.round(val/1000)}k`} tick={{ fontSize: 11 }} width={45}/>
+                  <Tooltip 
+                    formatter={(value: number) => `$${Math.round(value).toLocaleString()}`} 
+                    labelFormatter={(age) => `Age ${age}`}
+                  />
+                  <Legend />
+                  <Bar dataKey="withdrawalNeeded" stackId="w" fill="hsl(var(--sidebar-accent))" name="Net Withdrawal" radius={[0, 0, 0, 0]} />
+                  <Bar dataKey="taxOnWithdrawal" stackId="w" fill="hsl(var(--destructive))" name="Taxes" opacity={0.6} radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+        </ErrorBoundary>
+      </div>
+
+      <ErrorBoundary fallbackTitle="SS Comparison Error">
+        <Card>
+          <CardHeader>
+            <CardTitle className="font-serif flex items-center gap-2">
+              <CalendarClock size={18} /> Social Security Claiming Strategy
+            </CardTitle>
+            <CardDescription>Compare different claiming ages and their impact on your plan</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              {ssComparison.map(ss => {
+                const isCurrent = ss.claimAge === scenario.profile.socialSecurityAge;
+                return (
+                  <div key={ss.claimAge} className={`p-3 rounded-lg border-2 ${isCurrent ? 'border-primary bg-primary/5' : 'border-border'}`} data-testid={`card-ss-age-${ss.claimAge}`}>
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-lg font-bold font-mono">Age {ss.claimAge}</p>
+                      {isCurrent && <span className="text-[10px] bg-primary text-primary-foreground px-1.5 py-0.5 rounded">Current</span>}
+                    </div>
+                    <div className="space-y-1.5 text-xs">
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Monthly</span>
+                        <span className="font-mono font-semibold">${ss.monthlyBenefit.toLocaleString()}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Lifetime</span>
+                        <span className="font-mono font-semibold">${(ss.lifetimeTotal/1000000).toFixed(2)}M</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Portfolio End</span>
+                        <span className={`font-mono font-semibold ${ss.portfolioAtEnd > 0 ? 'text-primary' : 'text-destructive'}`}>
+                          {ss.portfolioAtEnd >= 1000000 ? `$${(ss.portfolioAtEnd/1000000).toFixed(1)}M` : ss.portfolioAtEnd > 0 ? `$${(ss.portfolioAtEnd/1000).toFixed(0)}K` : 'Depleted'}
+                        </span>
+                      </div>
+                      {ss.depletionAge && (
+                        <p className="text-destructive font-semibold text-center mt-1">Runs out age {ss.depletionAge}</p>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      </ErrorBoundary>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="font-serif text-lg flex items-center gap-2">
+            <TrendingUp size={18} /> Projection Summary
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div className="text-center p-3 bg-muted/30 rounded-lg">
+              <p className="text-xs text-muted-foreground uppercase">Final Balance</p>
+              <p className="text-lg font-mono font-bold" data-testid="text-final-balance">
+                {finalBalance >= 1000000 ? `$${(finalBalance/1000000).toFixed(1)}M` : `$${Math.round(finalBalance/1000)}K`}
+              </p>
+              <p className="text-[10px] text-muted-foreground">at age {scenario.profile.lifeExpectancy}</p>
+            </div>
+            <div className="text-center p-3 bg-muted/30 rounded-lg">
+              <p className="text-xs text-muted-foreground uppercase">Withdrawal Rate</p>
+              <p className="text-lg font-mono font-bold">{scenario.bucketConfig.withdrawalRate}%</p>
+              <p className="text-[10px] text-muted-foreground">${scenario.profile.monthlySpending.toLocaleString()}/mo</p>
+            </div>
+            <div className="text-center p-3 bg-muted/30 rounded-lg">
+              <p className="text-xs text-muted-foreground uppercase">Cash Phase</p>
+              <p className="text-lg font-mono font-bold">Years 1-{scenario.bucketConfig.cashTargetYears}</p>
+              <p className="text-[10px] text-muted-foreground">Zero market risk</p>
+            </div>
+            <div className="text-center p-3 bg-muted/30 rounded-lg">
+              <p className="text-xs text-muted-foreground uppercase">Bridge Phase</p>
+              <p className="text-lg font-mono font-bold">Years {scenario.bucketConfig.cashTargetYears + 1}-{scenario.bucketConfig.cashTargetYears + scenario.bucketConfig.bridgeTargetYears}</p>
+              <p className="text-[10px] text-muted-foreground">Moderate growth</p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+```
+
+### client/src/pages/Dashboard.tsx
+
+```tsx
+import { useMemo } from 'react';
+import { Layout } from '@/components/Layout';
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { useStore } from '@/lib/store';
+import { BucketVisualizer } from '@/components/BucketVisualizer';
+import { ArrowRight, TrendingUp, AlertTriangle, CheckCircle2, Wallet, Shield } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Link } from 'wouter';
+import { calculateRebalancing } from '@/lib/rebalance';
+import { runMonteCarlo } from '@/lib/montecarlo';
+
+function fmt(val: number): string {
+  if (val >= 1000000) return `$${(val / 1000000).toFixed(2)}M`;
+  if (val >= 1000) return `$${(val / 1000).toFixed(0)}K`;
+  return `$${val.toFixed(0)}`;
+}
+
+export default function Dashboard() {
+  const { holdings, activeScenarioId, scenarios, accounts } = useStore();
+  const scenario = scenarios.find(s => s.id === activeScenarioId);
+  const bc = scenario?.bucketConfig;
+
+  const totalValue = holdings.reduce((sum, h) => sum + (h.quantity * h.currentPrice), 0);
+  const withdrawalRate = bc?.withdrawalRate || 4.25;
+  const targetPortfolio = scenario ? (scenario.profile.monthlySpending * 12) / (withdrawalRate / 100) : 0;
+  const shortfall = targetPortfolio - totalValue;
+
+  // Bucket-target gap: surface the bucket farthest from its target so the
+  // dashboard tells you what to move, not just what you have.
+  const bucketGap = useMemo(() => {
+    if (!bc) return null;
+    const { bucketSummary } = calculateRebalancing(holdings, bc);
+    const funded = bucketSummary.filter(b => b.targetValue > 0);
+    if (funded.length === 0) return null;
+    // Worst-funded = lowest percent of target.
+    const worst = funded.reduce((a, b) => (a.percentOfTarget <= b.percentOfTarget ? a : b));
+    if (worst.action !== 'add') return null; // every bucket meets/exceeds target
+    const overfunded = bucketSummary.filter(b => b.action === 'reduce');
+    return { worst, overfunded };
+  }, [holdings, bc]);
+
+  // Monte Carlo: 250 trials for snappy dashboard load. Re-runs only when scenario or holdings change.
+  // Seeded so repeated visits show a stable number (the math is stochastic; the UX shouldn't be).
+  const monteCarlo = useMemo(() => {
+    if (!scenario || holdings.length === 0) return null;
+    return runMonteCarlo(scenario.profile, scenario.bucketConfig, holdings, accounts, { trials: 250, seed: 42 });
+  }, [scenario, holdings, accounts]);
+
+  return (
+    <Layout>
+      <div className="space-y-6">
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+            <div>
+                <h1 className="text-2xl md:text-3xl font-serif font-bold tracking-tight" data-testid="text-title">Dashboard</h1>
+                <p className="text-muted-foreground mt-1 text-sm">
+                    <span className="font-semibold text-foreground">{scenario?.name}</span>
+                    <span className="mx-2 text-border">·</span>
+                    ${scenario?.profile.monthlySpending?.toLocaleString()}/mo target at {withdrawalRate}%
+                </p>
+            </div>
+            <div className="flex gap-2 md:gap-3">
+                <Link href="/holdings">
+                    <Button variant="outline" size="sm" data-testid="button-holdings">Holdings</Button>
+                </Link>
+                <Link href="/projection">
+                    <Button size="sm" className="gap-1 md:gap-2" data-testid="button-projections">
+                        Projections <ArrowRight size={14} />
+                    </Button>
+                </Link>
+            </div>
+        </div>
+
+        {/* Hero: portfolio value gets the biggest stage; target/progress sits alongside */}
+        <Card className="overflow-hidden border-none shadow-lg bg-gradient-to-br from-sidebar via-sidebar to-sidebar/90 text-sidebar-foreground" data-testid="card-portfolio-value">
+            <CardContent className="p-6 md:p-8">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 md:gap-8 items-end">
+                    <div className="md:col-span-2 space-y-2">
+                        <p className="text-[11px] uppercase tracking-[0.14em] text-sidebar-foreground/55 font-medium flex items-center gap-1.5">
+                            <TrendingUp size={12} /> Portfolio Value
+                        </p>
+                        <div className="text-4xl md:text-6xl font-mono font-bold tracking-tight text-primary leading-none">
+                            {fmt(totalValue)}
+                        </div>
+                        <p className="text-xs text-sidebar-foreground/60">
+                            Across {holdings.length} {holdings.length === 1 ? 'holding' : 'holdings'} in {new Set(holdings.map(h => h.accountId)).size} {new Set(holdings.map(h => h.accountId)).size === 1 ? 'account' : 'accounts'}
+                        </p>
+                    </div>
+                    <div className="space-y-3 md:border-l md:border-sidebar-border/40 md:pl-8">
+                        <div>
+                            <p className="text-[10px] uppercase tracking-wider text-sidebar-foreground/55 font-medium">Target</p>
+                            <p className="text-lg md:text-2xl font-mono font-bold text-sidebar-foreground">{fmt(targetPortfolio)}</p>
+                        </div>
+                        <div>
+                            <p className="text-[10px] uppercase tracking-wider text-sidebar-foreground/55 font-medium flex items-center gap-1">
+                                {shortfall > 0 ? <AlertTriangle size={10} /> : <CheckCircle2 size={10} />}
+                                {shortfall > 0 ? 'Gap to target' : 'Above target'}
+                            </p>
+                            <p className={`text-lg md:text-2xl font-mono font-bold ${shortfall > 0 ? 'text-destructive' : 'text-primary'}`}>
+                                {shortfall > 0 ? '−' : '+'}{fmt(Math.abs(shortfall))}
+                            </p>
+                        </div>
+                        {/* Progress bar visualizing % of target */}
+                        <div className="pt-1">
+                            <div className="h-1.5 w-full rounded-full bg-sidebar-foreground/10 overflow-hidden">
+                                <div
+                                    className="h-full rounded-full bg-primary transition-all duration-700"
+                                    style={{ width: `${Math.min(100, targetPortfolio > 0 ? (totalValue / targetPortfolio) * 100 : 0)}%` }}
+                                />
+                            </div>
+                            <p className="text-[10px] text-sidebar-foreground/55 mt-1.5 font-mono">
+                                {targetPortfolio > 0 ? Math.min(999, (totalValue / targetPortfolio) * 100).toFixed(0) : 0}% of target
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </CardContent>
+        </Card>
+
+        {monteCarlo && (() => {
+          const pct = Math.round(monteCarlo.successRate * 100);
+          const tone = pct >= 85 ? 'primary' : pct >= 70 ? 'amber' : 'destructive';
+          const Icon = pct >= 85 ? CheckCircle2 : pct >= 70 ? Shield : AlertTriangle;
+          const headline = pct >= 85
+            ? 'Plan looks resilient under stress'
+            : pct >= 70
+              ? 'Plan is workable but exposed to bad markets'
+              : 'Plan is fragile — likely to run out';
+          const sub = `Across 250 simulations of varying market returns, your portfolio survived to age ${scenario?.profile.lifeExpectancy} in ${pct}% of trials.`;
+          return (
+            <Card data-testid="card-success-probability"
+              className={tone === 'primary'
+                ? 'border-primary/40 bg-primary/5'
+                : tone === 'amber'
+                  ? 'border-amber-500/40 bg-amber-500/5'
+                  : 'border-destructive/40 bg-destructive/5'}>
+              <CardContent className="p-4 md:p-5">
+                <div className="flex items-start gap-3">
+                  <div className={`rounded-full p-2 flex-shrink-0 ${
+                    tone === 'primary' ? 'bg-primary/15 text-primary'
+                    : tone === 'amber' ? 'bg-amber-500/15 text-amber-700 dark:text-amber-500'
+                    : 'bg-destructive/15 text-destructive'}`}>
+                    <Icon size={18} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex flex-col md:flex-row md:items-baseline md:justify-between gap-1">
+                      <p className="font-semibold text-foreground">
+                        Success probability:{' '}
+                        <span className={`font-mono ${
+                          tone === 'primary' ? 'text-primary'
+                          : tone === 'amber' ? 'text-amber-700 dark:text-amber-500'
+                          : 'text-destructive'}`}>{pct}%</span>
+                      </p>
+                      <p className="text-xs text-muted-foreground font-mono">
+                        Median final: ${(monteCarlo.percentiles.p50 / 1000).toLocaleString(undefined, { maximumFractionDigits: 0 })}K
+                        {' · '}
+                        Worst 5%: ${Math.max(0, monteCarlo.percentiles.p5 / 1000).toLocaleString(undefined, { maximumFractionDigits: 0 })}K
+                      </p>
+                    </div>
+                    <p className="text-sm text-foreground mt-1.5">{headline}.</p>
+                    <p className="text-xs text-muted-foreground mt-1">{sub}</p>
+                    <Link href="/projection">
+                      <Button variant="link" size="sm" className="px-0 h-auto mt-1">
+                        See the full stress test <ArrowRight size={12} className="ml-1" />
+                      </Button>
+                    </Link>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          );
+        })()}
+
+        {bucketGap && (
+          <Card className="border-destructive/50 bg-destructive/5" data-testid="card-bucket-gap">
+            <CardContent className="p-4 md:p-5">
+              <div className="flex items-start gap-3">
+                <div className="rounded-full bg-destructive/15 p-2 text-destructive flex-shrink-0">
+                  <AlertTriangle size={18} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex flex-col md:flex-row md:items-baseline md:justify-between gap-1">
+                    <p className="font-semibold text-foreground">
+                      {bucketGap.worst.label} is{' '}
+                      <span className="text-destructive font-mono">
+                        {bucketGap.worst.percentOfTarget.toFixed(0)}%
+                      </span>{' '}
+                      funded
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      <span className="font-mono">{fmt(bucketGap.worst.currentValue)}</span> of{' '}
+                      <span className="font-mono">{fmt(bucketGap.worst.targetValue)}</span> target
+                    </p>
+                  </div>
+                  <p className="text-sm text-foreground mt-1.5">
+                    Move <span className="font-mono font-bold text-destructive">{fmt(Math.abs(bucketGap.worst.difference))}</span>
+                    {bucketGap.overfunded.length > 0 ? (
+                      <> from {bucketGap.overfunded.map(b => b.label).join(' or ')} into {bucketGap.worst.label} to align with the strategy.</>
+                    ) : (
+                      <> into {bucketGap.worst.label} to align with the strategy.</>
+                    )}
+                  </p>
+                  <Link href="/buckets">
+                    <Button variant="link" size="sm" className="px-0 h-auto text-destructive mt-1" data-testid="button-bucket-gap-action">
+                      <Wallet size={14} className="mr-1" /> Open rebalancing dashboard <ArrowRight size={12} className="ml-1" />
+                    </Button>
+                  </Link>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        <section className="space-y-4">
+            <div className="flex items-center justify-between">
+                <h2 className="text-xl font-serif font-bold">Bucket Allocation</h2>
+                <Link href="/buckets">
+                    <Button variant="ghost" size="sm" data-testid="button-bucket-details">Details</Button>
+                </Link>
+            </div>
+            <BucketVisualizer />
+        </section>
+
+      </div>
+    </Layout>
+  );
+}
+```
+
+### client/src/pages/Buckets.tsx
+
+```tsx
+import { useMemo } from 'react';
+import { Layout } from '@/components/Layout';
+import { BucketVisualizer } from '@/components/BucketVisualizer';
+import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/components/ui/card';
+import { useStore } from '@/lib/store';
+import { Slider } from '@/components/ui/slider';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Separator } from '@/components/ui/separator';
+import { Clock, ArrowRight, ArrowUp, ArrowDown, Check } from 'lucide-react';
+import { calculateRebalancing } from '@/lib/rebalance';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+
+// Bound a numeric input to a sane range.
+const clamp = (n: number, min: number, max: number) =>
+  Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : min;
+
+export default function BucketsPage() {
+  const { activeScenarioId, scenarios, updateBucketConfig, holdings } = useStore();
+  const scenario = scenarios.find(s => s.id === activeScenarioId);
+  
+  if (!scenario) return null;
+
+  const bc = scenario.bucketConfig;
+
+  const rebalance = useMemo(() => {
+    return calculateRebalancing(holdings, bc);
+  }, [holdings, bc]);
+
+  const unassignedValue = holdings.filter(h => h.bucket === 'unassigned').reduce((s, h) => s + h.quantity * h.currentPrice, 0);
+
+  return (
+    <Layout>
+      <div className="space-y-8">
+        <div>
+            <h1 className="text-2xl md:text-3xl font-serif font-bold text-foreground" data-testid="text-bucket-title">Bucket Strategy</h1>
+            <p className="text-muted-foreground mt-1">
+                3-bucket allocation: Cash Reserve, Bridge, and Long-Term Growth.
+            </p>
+        </div>
+
+        <BucketVisualizer />
+
+        <ErrorBoundary fallbackTitle="Rebalancing Error">
+          <Card data-testid="card-rebalancing">
+            <CardHeader>
+              <CardTitle className="font-serif">Rebalancing Dashboard</CardTitle>
+              <CardDescription>How your current allocation compares to targets</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                {rebalance.bucketSummary.map(b => {
+                  const pct = Math.min(b.percentOfTarget, 150);
+                  return (
+                    <div key={b.bucket} className="p-4 rounded-lg border bg-muted/10" data-testid={`rebalance-${b.bucket}`}>
+                      <div className="flex items-center justify-between mb-2">
+                        <p className="font-semibold text-sm">{b.label}</p>
+                        {b.action === 'on-target' && <span className="text-xs text-primary flex items-center gap-1"><Check size={12} /> On target</span>}
+                        {b.action === 'add' && <span className="text-xs text-destructive flex items-center gap-1"><ArrowUp size={12} /> Under</span>}
+                        {b.action === 'reduce' && <span className="text-xs text-muted-foreground flex items-center gap-1"><ArrowDown size={12} /> Over</span>}
+                      </div>
+                      <div className="space-y-1.5 text-xs">
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Current</span>
+                          <span className="font-mono font-semibold">${(b.currentValue / 1000).toFixed(0)}K</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Target</span>
+                          <span className="font-mono font-semibold">${(b.targetValue / 1000).toFixed(0)}K</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Difference</span>
+                          <span className={`font-mono font-semibold ${b.difference >= 0 ? 'text-primary' : 'text-destructive'}`}>
+                            {b.difference >= 0 ? '+' : ''}{(b.difference / 1000).toFixed(0)}K
+                          </span>
+                        </div>
+                      </div>
+                      <div className="mt-3 h-2 bg-muted rounded-full overflow-hidden">
+                        <div 
+                          className={`h-full rounded-full transition-all ${b.action === 'on-target' ? 'bg-primary' : b.action === 'add' ? 'bg-destructive' : 'bg-muted-foreground'}`}
+                          style={{ width: `${Math.min(pct, 100)}%` }}
+                        />
+                      </div>
+                      <p className="text-[10px] text-muted-foreground mt-1 text-right">{b.percentOfTarget.toFixed(0)}% of target</p>
+                    </div>
+                  );
+                })}
+              </div>
+              {unassignedValue > 0 && (
+                <div className="p-3 bg-destructive/10 rounded-lg border border-destructive/30 text-xs">
+                  <p className="font-semibold text-destructive">
+                    ${(unassignedValue / 1000).toFixed(0)}K in unassigned holdings
+                  </p>
+                  <p className="text-muted-foreground mt-1">Assign holdings to buckets on the Holdings page for accurate tracking.</p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </ErrorBoundary>
+
+        <Card data-testid="card-withdrawal-sequence">
+          <CardHeader>
+            <CardTitle className="font-serif flex items-center gap-2"><Clock size={18} /> Withdrawal Sequence</CardTitle>
+            <CardDescription>How you draw down your portfolio over time</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="p-4 rounded-lg border-2 border-chart-3/30 bg-chart-3/5">
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="w-8 h-8 rounded-full bg-chart-3 text-white flex items-center justify-center text-sm font-bold">1</div>
+                  <div>
+                    <p className="font-semibold text-sm">Cash Reserve</p>
+                    <p className="text-[10px] text-muted-foreground">Years 1-{bc.cashTargetYears}</p>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">Spend first. HYSA at {bc.cashReturn}%. Net monthly draw ~${(scenario.profile.monthlySpending * (1 - bc.cashReturn / 100 / 12)).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.</p>
+                <p className="text-xs font-mono font-bold mt-2 text-chart-3">${(bc.cashTarget / 1000).toFixed(0)}K target</p>
+              </div>
+
+              <div className="p-4 rounded-lg border-2 border-chart-2/30 bg-chart-2/5 relative">
+                <div className="hidden md:block absolute -left-3 top-1/2 -translate-y-1/2 text-muted-foreground">
+                  <ArrowRight size={16} />
+                </div>
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="w-8 h-8 rounded-full bg-chart-2 text-white flex items-center justify-center text-sm font-bold">2</div>
+                  <div>
+                    <p className="font-semibold text-sm">Bridge</p>
+                    <p className="text-[10px] text-muted-foreground">Years {bc.cashTargetYears + 1}-{bc.cashTargetYears + bc.bridgeTargetYears}</p>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">Moderate growth at {bc.bridgeReturn}%. Cap gains tax rate (0-15%).</p>
+                <p className="text-xs font-mono font-bold mt-2 text-chart-2">${(bc.bridgeTarget / 1000).toFixed(0)}K target</p>
+              </div>
+
+              <div className="p-4 rounded-lg border-2 border-chart-1/30 bg-chart-1/5 relative">
+                <div className="hidden md:block absolute -left-3 top-1/2 -translate-y-1/2 text-muted-foreground">
+                  <ArrowRight size={16} />
+                </div>
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="w-8 h-8 rounded-full bg-chart-1 text-white flex items-center justify-center text-sm font-bold">3</div>
+                  <div>
+                    <p className="font-semibold text-sm">Growth</p>
+                    <p className="text-[10px] text-muted-foreground">Year {bc.cashTargetYears + bc.bridgeTargetYears + 1}+</p>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">Aggressive at {bc.growthReturn}%. Don't touch. Remainder of total portfolio need.</p>
+                <p className="text-xs font-mono font-bold mt-2 text-chart-1">${(bc.growthTarget / 1000000).toFixed(2)}M target</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <Card>
+                <CardHeader>
+                    <CardTitle className="font-serif">Target Configuration</CardTitle>
+                    <CardDescription>Set dollar targets and duration for each bucket.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                    <div className="space-y-4">
+                        <div className="flex justify-between items-center">
+                            <Label>B1 Cash Reserve Duration</Label>
+                            <span className="font-mono text-sm">{bc.cashTargetYears} yrs → ${(scenario.profile.monthlySpending * 12 * bc.cashTargetYears / 1000).toFixed(0)}K</span>
+                        </div>
+                        <Slider min={1} max={5} step={1} value={[bc.cashTargetYears]} onValueChange={(v) => updateBucketConfig({ cashTargetYears: v[0] })} data-testid="slider-cash-years" />
+                    </div>
+                    <div className="space-y-4">
+                        <div className="flex justify-between items-center">
+                            <Label>B2 Bridge Duration</Label>
+                            <span className="font-mono text-sm">{bc.bridgeTargetYears} yrs → ${(scenario.profile.monthlySpending * 12 * bc.bridgeTargetYears / 1000).toFixed(0)}K</span>
+                        </div>
+                        <Slider min={3} max={10} step={1} value={[bc.bridgeTargetYears]} onValueChange={(v) => updateBucketConfig({ bridgeTargetYears: v[0] })} data-testid="slider-bridge-years" />
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                        <Label>Withdrawal Rate %</Label>
+                        <Input type="number" step="0.25" min={1} max={15} value={bc.withdrawalRate} onChange={(e) => updateBucketConfig({ withdrawalRate: clamp(Number(e.target.value), 1, 15) })} data-testid="input-withdrawal-rate" />
+                        <p className="text-[10px] text-muted-foreground">Annual withdrawal as % of portfolio. At {bc.withdrawalRate}%, ${scenario.profile.monthlySpending.toLocaleString()}/mo needs a ${((scenario.profile.monthlySpending * 12) / (bc.withdrawalRate / 100) / 1000000).toFixed(2)}M portfolio. B3 = total needed minus B1 and B2.</p>
+                    </div>
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="space-y-1.5">
+                        <Label className="text-xs">B1 Target $</Label>
+                        <Input type="number" min={0} max={50000000} value={bc.cashTarget} onChange={(e) => updateBucketConfig({ cashTarget: clamp(Number(e.target.value), 0, 50000000) })} data-testid="input-cash-target" />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label className="text-xs">B2 Target $</Label>
+                        <Input type="number" min={0} max={50000000} value={bc.bridgeTarget} onChange={(e) => updateBucketConfig({ bridgeTarget: clamp(Number(e.target.value), 0, 50000000) })} data-testid="input-bridge-target" />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label className="text-xs">B3 Target $</Label>
+                        <Input type="number" min={0} max={50000000} value={bc.growthTarget} onChange={(e) => updateBucketConfig({ growthTarget: clamp(Number(e.target.value), 0, 50000000) })} data-testid="input-growth-target" />
+                      </div>
+                    </div>
+                </CardContent>
+            </Card>
+
+            <Card>
+                <CardHeader>
+                    <CardTitle className="font-serif">Return Assumptions</CardTitle>
+                    <CardDescription>Expected annual returns for projection (Nominal).</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                     <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                            <Label>Cash Return %</Label>
+                            <Input type="number" step="0.25" min={0} max={20} value={bc.cashReturn} onChange={(e) => updateBucketConfig({ cashReturn: clamp(Number(e.target.value), 0, 20) })} data-testid="input-cash-return" />
+                            <p className="text-[10px] text-muted-foreground">HYSA / Money Market</p>
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Bridge Return %</Label>
+                            <Input type="number" step="0.25" min={0} max={25} value={bc.bridgeReturn} onChange={(e) => updateBucketConfig({ bridgeReturn: clamp(Number(e.target.value), 0, 25) })} data-testid="input-bridge-return" />
+                            <p className="text-[10px] text-muted-foreground">Diversified mix</p>
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Growth Return %</Label>
+                            <Input type="number" step="0.25" min={0} max={30} value={bc.growthReturn} onChange={(e) => updateBucketConfig({ growthReturn: clamp(Number(e.target.value), 0, 30) })} data-testid="input-growth-return" />
+                            <p className="text-[10px] text-muted-foreground">Stocks / Aggressive</p>
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Inflation %</Label>
+                            <Input type="number" disabled value={scenario.profile.inflationRate} className="bg-muted" />
+                             <p className="text-[10px] text-muted-foreground">Edit in Settings</p>
+                        </div>
+                     </div>
+                     <Separator />
+                     <div>
+                       <p className="text-xs font-semibold text-primary mb-3">B2 Bridge Target Allocation</p>
+                       <div className="grid grid-cols-3 gap-2 text-[11px]">
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">30%</span><br/>US Large Cap<br/><span className="text-muted-foreground">VOO/VTI</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">20%</span><br/>Growth<br/><span className="text-muted-foreground">VONG/VUG</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">15%</span><br/>International<br/><span className="text-muted-foreground">VXUS</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">20%</span><br/>Bonds<br/><span className="text-muted-foreground">BND/SCHZ</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">10%</span><br/>Alternatives<br/><span className="text-muted-foreground">IAU/VNQ</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">5%</span><br/>Crypto<br/><span className="text-muted-foreground">IBIT</span></div>
+                       </div>
+                     </div>
+                     <div>
+                       <p className="text-xs font-semibold text-primary mb-3">B3 Growth Target Allocation</p>
+                       <div className="grid grid-cols-3 gap-2 text-[11px]">
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">35%</span><br/>US Total Mkt<br/><span className="text-muted-foreground">VOO</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">25%</span><br/>US Growth<br/><span className="text-muted-foreground">GOOG,TSLA</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">20%</span><br/>International<br/><span className="text-muted-foreground">VXUS</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">10%</span><br/>Small/Mid<br/><span className="text-muted-foreground">VO, VXF</span></div>
+                         <div className="p-2 bg-muted/30 rounded text-center"><span className="font-bold">10%</span><br/>Crypto<br/><span className="text-muted-foreground">IBIT</span></div>
+                       </div>
+                     </div>
+                </CardContent>
+            </Card>
+        </div>
+      </div>
+    </Layout>
+  );
+}
+```
+
+### client/src/pages/Scenarios.tsx
+
+```tsx
+import { useMemo, useState } from 'react';
+import { Layout } from '@/components/Layout';
+import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/components/ui/card';
+import { useStore } from '@/lib/store';
+import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { Separator } from '@/components/ui/separator';
+import { Users, Banknote, CalendarClock, Wallet, FileText, Plus, Copy, Trash2, Check, X, Receipt } from 'lucide-react';
+import { runProjection } from '@/lib/engine';
+import { toast } from 'sonner';
+
+// Bound a numeric input to a sane range. Used everywhere the user types a number.
+const clamp = (n: number, min: number, max: number) =>
+  Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : min;
+
+export default function ScenariosPage() {
+  const { activeScenarioId, scenarios, updateUserProfile, addScenario, duplicateScenario, removeScenario, renameScenario, setActiveScenario, holdings, accounts } = useStore();
+  const scenario = scenarios.find(s => s.id === activeScenarioId);
+  const [editingName, setEditingName] = useState<string | null>(null);
+  const [tempName, setTempName] = useState('');
+
+  // Memoize projection per scenario so typing in one card doesn't re-run all of them.
+  const projectionsByScenarioId = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof runProjection>>();
+    for (const s of scenarios) {
+      map.set(s.id, runProjection(s.profile, s.bucketConfig, holdings, { accounts }));
+    }
+    return map;
+  }, [scenarios, holdings]);
+
+  if (!scenario) return null;
+
+  const handleAddScenario = () => {
+    const name = `Scenario ${scenarios.length + 1}`;
+    addScenario(name);
+    toast.success(`Created "${name}"`);
+  };
+
+  const handleDuplicate = (id: string) => {
+    const source = scenarios.find(s => s.id === id);
+    if (!source) return;
+    duplicateScenario(id, `${source.name} (Copy)`);
+    toast.success('Scenario duplicated');
+  };
+
+  return (
+    <Layout>
+      <div className="space-y-8">
+        <div>
+          <h1 className="text-2xl md:text-3xl font-serif font-bold text-foreground" data-testid="text-settings-title">Settings</h1>
+          <p className="text-muted-foreground mt-1">Configure the variables that drive your retirement plan.</p>
+        </div>
+
+        <section className="space-y-4">
+          <div className="flex items-center justify-between border-b pb-2">
+            <div className="flex items-center gap-2 text-primary">
+              <FileText size={20} />
+              <h2 className="text-lg font-semibold">Scenarios</h2>
+            </div>
+            <Button variant="outline" size="sm" onClick={handleAddScenario} data-testid="button-add-scenario">
+              <Plus size={14} className="mr-1" /> New Scenario
+            </Button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {scenarios.map(s => {
+              const proj = projectionsByScenarioId.get(s.id) ?? [];
+              const finalBal = proj[proj.length - 1]?.totalPortfolio || 0;
+              const depletionYear = proj.find(d => d.totalPortfolio <= 0);
+              const isActive = s.id === activeScenarioId;
+
+              return (
+                <Card
+                  key={s.id}
+                  className={`cursor-pointer transition-all ${isActive ? 'ring-2 ring-primary border-primary' : 'hover:border-primary/50'}`}
+                  onClick={() => setActiveScenario(s.id)}
+                  data-testid={`card-scenario-${s.id}`}
+                >
+                  <CardContent className="p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      {editingName === s.id ? (
+                        <div className="flex items-center gap-1">
+                          <Input
+                            value={tempName}
+                            onChange={(e) => setTempName(e.target.value)}
+                            className="h-7 text-sm w-32"
+                            onClick={(e) => e.stopPropagation()}
+                          />
+                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={(e) => { e.stopPropagation(); renameScenario(s.id, tempName); setEditingName(null); }}>
+                            <Check size={12} />
+                          </Button>
+                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={(e) => { e.stopPropagation(); setEditingName(null); }}>
+                            <X size={12} />
+                          </Button>
+                        </div>
+                      ) : (
+                        <button
+                          className="text-sm font-semibold hover:text-primary text-left"
+                          onClick={(e) => { e.stopPropagation(); setEditingName(s.id); setTempName(s.name); }}
+                        >
+                          {s.name} {isActive && <span className="text-primary text-xs">(active)</span>}
+                        </button>
+                      )}
+                      <div className="flex gap-1">
+                        <Button variant="ghost" size="icon" className="h-6 w-6" onClick={(e) => { e.stopPropagation(); handleDuplicate(s.id); }} data-testid={`button-duplicate-${s.id}`}>
+                          <Copy size={12} />
+                        </Button>
+                        {scenarios.length > 1 && (
+                          <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive" onClick={(e) => { e.stopPropagation(); removeScenario(s.id); toast.success('Scenario removed'); }} data-testid={`button-delete-${s.id}`}>
+                            <Trash2 size={12} />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-xs">
+                      <div>
+                        <p className="text-muted-foreground">Spending</p>
+                        <p className="font-mono font-semibold">${(s.profile.monthlySpending/1000).toFixed(0)}k/mo</p>
+                      </div>
+                      <div>
+                        <p className="text-muted-foreground">Final Balance</p>
+                        <p className={`font-mono font-semibold ${finalBal <= 0 ? 'text-destructive' : 'text-primary'}`}>
+                          {finalBal >= 1000000 ? `$${(finalBal/1000000).toFixed(1)}M` : finalBal > 0 ? `$${(finalBal/1000).toFixed(0)}K` : '$0'}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-muted-foreground">Lasts To</p>
+                        <p className={`font-mono font-semibold ${depletionYear ? 'text-destructive' : 'text-primary'}`}>
+                          {depletionYear ? `Age ${depletionYear.age}` : `Age ${s.profile.lifeExpectancy}+`}
+                        </p>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="space-y-4">
+           <div className="flex items-center gap-2 text-primary border-b pb-2">
+              <Users size={20} />
+              <h2 className="text-lg font-semibold">Household Profile</h2>
+           </div>
+           
+           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <Card className="bg-background">
+                  <CardHeader className="pb-3">
+                      <CardTitle className="text-base font-medium text-muted-foreground">Primary Earner</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                       <div className="grid grid-cols-3 gap-3">
+                          <div className="space-y-2">
+                              <Label className="text-xs">Current Age</Label>
+                              <Input type="number" min={18} max={100} value={scenario.profile.currentAge} onChange={(e) => updateUserProfile({ currentAge: clamp(Number(e.target.value), 18, 100) })} data-testid="input-current-age" />
+                          </div>
+                          <div className="space-y-2">
+                              <Label className="text-xs">Retirement Age</Label>
+                              <Input type="number" min={18} max={100} value={scenario.profile.retirementAge} onChange={(e) => updateUserProfile({ retirementAge: clamp(Number(e.target.value), 18, 100) })} data-testid="input-retirement-age" />
+                          </div>
+                          <div className="space-y-2">
+                              <Label className="text-xs">Plan To Age</Label>
+                              <Input type="number" min={50} max={120} value={scenario.profile.lifeExpectancy} onChange={(e) => updateUserProfile({ lifeExpectancy: clamp(Number(e.target.value), 50, 120) })} data-testid="input-life-expectancy" />
+                          </div>
+                      </div>
+                  </CardContent>
+              </Card>
+
+              <Card className="bg-background">
+                  <CardHeader className="pb-3">
+                      <CardTitle className="text-base font-medium text-muted-foreground">
+                        Spouse / Partner {scenario.profile.spouseName ? `(${scenario.profile.spouseName})` : ''}
+                      </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="space-y-2">
+                            <Label className="text-xs">Name</Label>
+                            <Input value={scenario.profile.spouseName || ''} placeholder="Optional" onChange={(e) => updateUserProfile({ spouseName: e.target.value || undefined })} data-testid="input-spouse-name" />
+                        </div>
+                        <div className="space-y-2">
+                            <Label className="text-xs">Current Age</Label>
+                             <Input type="number" min={18} max={100} value={scenario.profile.spouseAge || ''} placeholder="Optional" onChange={(e) => updateUserProfile({ spouseAge: e.target.value ? clamp(Number(e.target.value), 18, 100) : undefined })} data-testid="input-spouse-age" />
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                          <Label className="text-xs">Spouse Monthly Income</Label>
+                          <div className="relative">
+                            <span className="absolute left-3 top-2.5 text-muted-foreground text-sm">$</span>
+                            <Input type="number" className="pl-7" min={0} max={100000} value={scenario.profile.spouseIncome || ''} placeholder="0" onChange={(e) => updateUserProfile({ spouseIncome: e.target.value ? clamp(Number(e.target.value), 0, 100000) : undefined })} data-testid="input-spouse-income" />
+                          </div>
+                          <p className="text-[10px] text-muted-foreground">Ongoing income (e.g. $3,333/mo = $40K/year)</p>
+                      </div>
+                  </CardContent>
+              </Card>
+           </div>
+        </section>
+
+        <section className="space-y-4">
+            <div className="flex items-center gap-2 text-primary border-b pb-2">
+                <Banknote size={20} />
+                <h2 className="text-lg font-semibold">Income & Spending</h2>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <Card className="md:col-span-1 border-primary/20 shadow-sm">
+                    <CardHeader>
+                        <CardTitle className="text-base font-serif">Spending Needs</CardTitle>
+                        <CardDescription>Target monthly budget (today's dollars)</CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                        <div className="space-y-2">
+                             <Label className="text-lg font-semibold text-primary">Monthly Budget</Label>
+                             <div className="relative">
+                                <span className="absolute left-3 top-2.5 text-muted-foreground">$</span>
+                                <Input type="number" className="pl-7 text-lg font-mono font-bold" min={0} max={1000000} value={scenario.profile.monthlySpending} onChange={(e) => updateUserProfile({ monthlySpending: clamp(Number(e.target.value), 0, 1000000) })} data-testid="input-monthly-spending" />
+                             </div>
+                        </div>
+                        <div className="space-y-2">
+                             <Label className="text-xs">Inflation Rate %</Label>
+                             <Input type="number" step="0.5" min={-5} max={20} value={scenario.profile.inflationRate} onChange={(e) => updateUserProfile({ inflationRate: clamp(Number(e.target.value), -5, 20) })} data-testid="input-inflation-rate" />
+                        </div>
+                        <p className="text-xs text-muted-foreground leading-relaxed">
+                            Adjusted for inflation annually. At {scenario.bucketConfig.withdrawalRate}% withdrawal rate, ${scenario.profile.monthlySpending.toLocaleString()}/mo needs a ${((scenario.profile.monthlySpending * 12) / (scenario.bucketConfig.withdrawalRate / 100) / 1000000).toFixed(2)}M portfolio.
+                        </p>
+                    </CardContent>
+                </Card>
+
+                <Card className="md:col-span-2">
+                    <CardHeader>
+                        <CardTitle className="text-base font-serif">Guaranteed Income Sources</CardTitle>
+                        <CardDescription>Social Security, Pensions, Annuities</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                            <div className="space-y-4">
+                                <div className="flex items-center gap-2 text-sm font-semibold text-primary">
+                                    <CalendarClock size={16}/> Primary Social Security
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div className="space-y-1.5">
+                                        <Label className="text-xs">Claim Age</Label>
+                                        <Input type="number" min={62} max={70} value={scenario.profile.socialSecurityAge} onChange={(e) => updateUserProfile({ socialSecurityAge: clamp(Number(e.target.value), 62, 70) })} data-testid="input-ss-age" />
+                                    </div>
+                                    <div className="space-y-1.5">
+                                        <Label className="text-xs">Monthly Amount</Label>
+                                        <Input type="number" min={0} max={100000} value={scenario.profile.socialSecurityAmount} onChange={(e) => updateUserProfile({ socialSecurityAmount: clamp(Number(e.target.value), 0, 100000) })} data-testid="input-ss-amount" />
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="space-y-4 border-l pl-0 md:pl-8 border-dashed md:border-solid">
+                                <div className="flex items-center gap-2 text-sm font-semibold text-primary">
+                                    <CalendarClock size={16}/> Spouse Social Security
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div className="space-y-1.5">
+                                        <Label className="text-xs">Claim Age</Label>
+                                        <Input type="number" min={62} max={70} placeholder="67" value={scenario.profile.spouseSocialSecurityAge || ''} onChange={(e) => updateUserProfile({ spouseSocialSecurityAge: e.target.value ? clamp(Number(e.target.value), 62, 70) : undefined })} data-testid="input-spouse-ss-age" />
+                                    </div>
+                                    <div className="space-y-1.5">
+                                        <Label className="text-xs">Monthly Amount</Label>
+                                        <Input type="number" min={0} max={100000} placeholder="0" value={scenario.profile.spouseSocialSecurityAmount || ''} onChange={(e) => updateUserProfile({ spouseSocialSecurityAmount: e.target.value ? clamp(Number(e.target.value), 0, 100000) : undefined })} data-testid="input-spouse-ss-amount" />
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="md:col-span-2 pt-4 border-t">
+                                <div className="flex items-center gap-2 text-sm font-semibold text-primary mb-3">
+                                    <Wallet size={16}/> Other Income
+                                </div>
+                                <div className="space-y-2 max-w-[50%]">
+                                    <Label className="text-xs">Pension / Annuity (Monthly)</Label>
+                                    <Input type="number" min={0} max={100000} value={scenario.profile.otherIncome} onChange={(e) => updateUserProfile({ otherIncome: clamp(Number(e.target.value), 0, 100000) })} data-testid="input-other-income" />
+                                </div>
+                            </div>
+                        </div>
+                    </CardContent>
+                </Card>
+            </div>
+        </section>
+
+        <section className="space-y-4">
+          <div className="flex items-center gap-2 text-primary border-b pb-2">
+              <Receipt size={20} />
+              <h2 className="text-lg font-semibold">Tax Rates</h2>
+          </div>
+          <Card>
+            <CardContent className="pt-6">
+              <div className="grid grid-cols-3 gap-4">
+                <div className="space-y-2">
+                  <Label className="text-xs">Federal Marginal %</Label>
+                  <Input type="number" step="1" min={0} max={50} value={scenario.profile.taxConfig?.federalRate ?? 22} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), federalRate: clamp(Number(e.target.value), 0, 50) } })} data-testid="input-federal-rate" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">State Rate %</Label>
+                  <Input type="number" step="1" min={0} max={20} value={scenario.profile.taxConfig?.stateRate ?? 5} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), stateRate: clamp(Number(e.target.value), 0, 20) } })} data-testid="input-state-rate" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">Capital Gains %</Label>
+                  <Input type="number" step="1" min={0} max={30} value={scenario.profile.taxConfig?.capitalGainsRate ?? 15} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), capitalGainsRate: clamp(Number(e.target.value), 0, 30) } })} data-testid="input-capgains-rate" />
+                </div>
+              </div>
+              <p className="text-[10px] text-muted-foreground mt-3">
+                Used in projections: Cash phase = 0% tax, Bridge phase = capital gains rate, Growth phase = blended income tax rate.
+              </p>
+            </CardContent>
+          </Card>
+        </section>
+
+        <section className="space-y-4">
+          <div className="flex items-center gap-2 text-primary border-b pb-2">
+              <FileText size={20} />
+              <h2 className="text-lg font-semibold">Key Assumptions</h2>
+          </div>
+          <Card>
+            <CardContent className="pt-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                <div className="space-y-2">
+                  <div className="flex justify-between py-1.5 border-b border-dashed">
+                    <span className="text-muted-foreground">Monthly Target</span>
+                    <span className="font-mono font-semibold">${scenario.profile.monthlySpending.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-dashed">
+                    <span className="text-muted-foreground">Withdrawal Rate</span>
+                    <span className="font-mono font-semibold">{scenario.bucketConfig.withdrawalRate}%</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-dashed">
+                    <span className="text-muted-foreground">HYSA Rate (Cash)</span>
+                    <span className="font-mono font-semibold">{scenario.bucketConfig.cashReturn}%</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-dashed">
+                    <span className="text-muted-foreground">Bridge Growth</span>
+                    <span className="font-mono font-semibold">{scenario.bucketConfig.bridgeReturn}%</span>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex justify-between py-1.5 border-b border-dashed">
+                    <span className="text-muted-foreground">Growth Return</span>
+                    <span className="font-mono font-semibold">{scenario.bucketConfig.growthReturn}%</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-dashed">
+                    <span className="text-muted-foreground">Inflation</span>
+                    <span className="font-mono font-semibold">{scenario.profile.inflationRate}%</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-dashed">
+                    <span className="text-muted-foreground">{scenario.profile.spouseName || 'Spouse'} Income</span>
+                    <span className="font-mono font-semibold">${((scenario.profile.spouseIncome || 0) * 12).toLocaleString()}/yr</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-dashed">
+                    <span className="text-muted-foreground">Home Equity (excluded)</span>
+                    <span className="font-mono font-semibold text-muted-foreground">~$900K</span>
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </section>
+      </div>
+    </Layout>
+  );
+}
+```
+
+### client/src/pages/Report.tsx
+
+```tsx
+import { useMemo } from 'react';
+import { Layout } from '@/components/Layout';
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { useStore } from '@/lib/store';
+import { runProjection, compareSSClaimingAges } from '@/lib/engine';
+import { calculateRebalancing } from '@/lib/rebalance';
+import { Printer, Download } from 'lucide-react';
+
+export default function ReportPage() {
+  const { activeScenarioId, scenarios, holdings, accounts } = useStore();
+  const scenario = scenarios.find(s => s.id === activeScenarioId);
+
+  const data = useMemo(() => {
+    if (!scenario) return [];
+    return runProjection(scenario.profile, scenario.bucketConfig, holdings, { accounts });
+  }, [scenario, holdings, accounts]);
+
+  const rebalance = useMemo(() => {
+    if (!scenario) return null;
+    return calculateRebalancing(holdings, scenario.bucketConfig);
+  }, [holdings, scenario]);
+
+  const ssComparison = useMemo(() => {
+    if (!scenario) return [];
+    return compareSSClaimingAges(scenario.profile, scenario.bucketConfig, holdings);
+  }, [scenario, holdings]);
+
+  if (!scenario) return null;
+
+  const depletionYear = data.find(d => d.totalPortfolio <= 0);
+  const finalBalance = data[data.length - 1]?.totalPortfolio || 0;
+  const totalPortfolio = holdings.reduce((s, h) => s + h.quantity * h.currentPrice, 0);
+  const bc = scenario.bucketConfig;
+  const profile = scenario.profile;
+
+  const handlePrint = () => window.print();
+
+  const handleExportCSV = () => {
+    const headers = ['Year', 'Age', 'Spending Need', 'Income', 'Withdrawal', 'Tax', 'Cash Balance', 'Bridge Balance', 'Growth Balance', 'Total Portfolio', 'Source'];
+    const rows = data.map(d => [
+      d.year, d.age,
+      Math.round(d.spendingNeed), Math.round(d.income),
+      Math.round(d.withdrawalNeeded), Math.round(d.taxOnWithdrawal),
+      Math.round(d.endBalanceCash), Math.round(d.endBalanceBridge), Math.round(d.endBalanceGrowth),
+      Math.round(d.totalPortfolio), d.withdrawalSource
+    ]);
+    const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `retirement-projection-${scenario.name.replace(/\s+/g, '-')}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <Layout>
+      <div className="space-y-6 print:space-y-4">
+        <div className="flex items-center justify-between print:hidden">
+          <div>
+            <h1 className="text-2xl md:text-3xl font-serif font-bold" data-testid="text-report-title">Retirement Plan Report</h1>
+            <p className="text-muted-foreground mt-1">Printable summary for: {scenario.name}</p>
+          </div>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={handleExportCSV} data-testid="button-export-csv">
+              <Download size={14} className="mr-1" /> Export CSV
+            </Button>
+            <Button size="sm" onClick={handlePrint} data-testid="button-print">
+              <Printer size={14} className="mr-1" /> Print
+            </Button>
+          </div>
+        </div>
+
+        <div className="hidden print:block text-center border-b pb-4 mb-6">
+          <h1 className="text-3xl font-serif font-bold">3-Bucket Retirement Plan</h1>
+          <p className="text-sm text-muted-foreground mt-1">{scenario.name} - Generated {new Date().toLocaleDateString()}</p>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 print:grid-cols-4">
+          <Card>
+            <CardContent className="p-3 text-center">
+              <p className="text-[10px] text-muted-foreground uppercase">Total Portfolio</p>
+              <p className="text-lg font-mono font-bold">${(totalPortfolio / 1000000).toFixed(2)}M</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-3 text-center">
+              <p className="text-[10px] text-muted-foreground uppercase">Monthly Spending</p>
+              <p className="text-lg font-mono font-bold">${profile.monthlySpending.toLocaleString()}</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-3 text-center">
+              <p className="text-[10px] text-muted-foreground uppercase">Final Balance</p>
+              <p className={`text-lg font-mono font-bold ${finalBalance > 0 ? 'text-primary' : 'text-destructive'}`}>
+                {finalBalance >= 1000000 ? `$${(finalBalance/1000000).toFixed(1)}M` : finalBalance > 0 ? `$${(finalBalance/1000).toFixed(0)}K` : '$0'}
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-3 text-center">
+              <p className="text-[10px] text-muted-foreground uppercase">Lasts Until</p>
+              <p className={`text-lg font-mono font-bold ${depletionYear ? 'text-destructive' : 'text-primary'}`}>
+                {depletionYear ? `Age ${depletionYear.age}` : `Age ${profile.lifeExpectancy}+`}
+              </p>
+            </CardContent>
+          </Card>
+        </div>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="font-serif text-base">Household Profile</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-sm">
+              <div className="flex justify-between py-1 border-b border-dashed"><span className="text-muted-foreground">Age</span><span className="font-mono">{profile.currentAge}</span></div>
+              <div className="flex justify-between py-1 border-b border-dashed"><span className="text-muted-foreground">Plan to age</span><span className="font-mono">{profile.lifeExpectancy}</span></div>
+              <div className="flex justify-between py-1 border-b border-dashed"><span className="text-muted-foreground">Spouse</span><span className="font-mono">{profile.spouseName || 'N/A'} (age {profile.spouseAge || '?'})</span></div>
+              <div className="flex justify-between py-1 border-b border-dashed"><span className="text-muted-foreground">Spouse income</span><span className="font-mono">${((profile.spouseIncome || 0) * 12).toLocaleString()}/yr</span></div>
+              <div className="flex justify-between py-1 border-b border-dashed"><span className="text-muted-foreground">SS claim age</span><span className="font-mono">{profile.socialSecurityAge}</span></div>
+              <div className="flex justify-between py-1 border-b border-dashed"><span className="text-muted-foreground">SS monthly</span><span className="font-mono">${profile.socialSecurityAmount.toLocaleString()}</span></div>
+              <div className="flex justify-between py-1 border-b border-dashed"><span className="text-muted-foreground">Withdrawal rate</span><span className="font-mono">{bc.withdrawalRate}%</span></div>
+              <div className="flex justify-between py-1 border-b border-dashed"><span className="text-muted-foreground">Inflation</span><span className="font-mono">{profile.inflationRate}%</span></div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="font-serif text-base">Bucket Strategy</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-3 gap-4 text-sm">
+              <div className="p-3 border rounded-lg">
+                <p className="font-semibold">B1: Cash Reserve</p>
+                <p className="text-xs text-muted-foreground">Years 1-{bc.cashTargetYears} at {bc.cashReturn}%</p>
+                <p className="font-mono font-bold mt-1">${(bc.cashTarget/1000).toFixed(0)}K target</p>
+                {rebalance && <p className="text-xs mt-1">Current: ${(rebalance.bucketSummary[0].currentValue/1000).toFixed(0)}K ({rebalance.bucketSummary[0].percentOfTarget.toFixed(0)}%)</p>}
+              </div>
+              <div className="p-3 border rounded-lg">
+                <p className="font-semibold">B2: Bridge</p>
+                <p className="text-xs text-muted-foreground">Years {bc.cashTargetYears+1}-{bc.cashTargetYears+bc.bridgeTargetYears} at {bc.bridgeReturn}%</p>
+                <p className="font-mono font-bold mt-1">${(bc.bridgeTarget/1000).toFixed(0)}K target</p>
+                {rebalance && <p className="text-xs mt-1">Current: ${(rebalance.bucketSummary[1].currentValue/1000).toFixed(0)}K ({rebalance.bucketSummary[1].percentOfTarget.toFixed(0)}%)</p>}
+              </div>
+              <div className="p-3 border rounded-lg">
+                <p className="font-semibold">B3: Growth</p>
+                <p className="text-xs text-muted-foreground">Year {bc.cashTargetYears+bc.bridgeTargetYears+1}+ at {bc.growthReturn}%</p>
+                <p className="font-mono font-bold mt-1">${(bc.growthTarget/1000000).toFixed(2)}M target</p>
+                {rebalance && <p className="text-xs mt-1">Current: ${(rebalance.bucketSummary[2].currentValue/1000).toFixed(0)}K ({rebalance.bucketSummary[2].percentOfTarget.toFixed(0)}%)</p>}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="font-serif text-base">Social Security Comparison</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-4 gap-3 text-sm">
+              {ssComparison.map(ss => (
+                <div key={ss.claimAge} className={`p-2 rounded border text-center ${ss.claimAge === profile.socialSecurityAge ? 'border-primary bg-primary/5' : ''}`}>
+                  <p className="font-bold">Age {ss.claimAge}</p>
+                  <p className="font-mono text-xs">${ss.monthlyBenefit.toLocaleString()}/mo</p>
+                  <p className="font-mono text-xs">Lifetime: ${(ss.lifetimeTotal/1000000).toFixed(2)}M</p>
+                  <p className={`font-mono text-xs font-semibold ${ss.portfolioAtEnd > 0 ? 'text-primary' : 'text-destructive'}`}>
+                    End: {ss.portfolioAtEnd >= 1000000 ? `$${(ss.portfolioAtEnd/1000000).toFixed(1)}M` : ss.portfolioAtEnd > 0 ? `$${(ss.portfolioAtEnd/1000).toFixed(0)}K` : 'Depleted'}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="font-serif text-base">Year-by-Year Projection (First 15 Years)</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b">
+                    <th className="text-left py-1.5 pr-2">Age</th>
+                    <th className="text-right py-1.5 px-2">Spending</th>
+                    <th className="text-right py-1.5 px-2">Income</th>
+                    <th className="text-right py-1.5 px-2">Withdrawal</th>
+                    <th className="text-right py-1.5 px-2">Cash</th>
+                    <th className="text-right py-1.5 px-2">Bridge</th>
+                    <th className="text-right py-1.5 px-2">Growth</th>
+                    <th className="text-right py-1.5 pl-2">Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.slice(0, 15).map(d => (
+                    <tr key={d.age} className="border-b border-dashed">
+                      <td className="py-1.5 pr-2 font-semibold">{d.age}</td>
+                      <td className="text-right py-1.5 px-2 font-mono">${(d.spendingNeed/1000).toFixed(0)}K</td>
+                      <td className="text-right py-1.5 px-2 font-mono">${(d.income/1000).toFixed(0)}K</td>
+                      <td className="text-right py-1.5 px-2 font-mono">${(d.withdrawalNeeded/1000).toFixed(0)}K</td>
+                      <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceCash/1000).toFixed(0)}K</td>
+                      <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceBridge/1000).toFixed(0)}K</td>
+                      <td className="text-right py-1.5 px-2 font-mono">${(d.endBalanceGrowth/1000).toFixed(0)}K</td>
+                      <td className="text-right py-1.5 pl-2 font-mono font-semibold">${d.totalPortfolio >= 1000000 ? `${(d.totalPortfolio/1000000).toFixed(2)}M` : `${(d.totalPortfolio/1000).toFixed(0)}K`}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+
+        <p className="text-[10px] text-center text-muted-foreground print:block">
+          This report is for informational purposes only and does not constitute financial advice. 
+          Generated by 3-Bucket Retirement Planner on {new Date().toLocaleDateString()}.
+        </p>
+      </div>
+    </Layout>
+  );
+}
+```
+
+### client/src/index.css
+
+```css
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+  
+  --color-sidebar: hsl(var(--sidebar));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar-primary: hsl(var(--sidebar-primary));
+  --color-sidebar-primary-foreground: hsl(var(--sidebar-primary-foreground));
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
+  --color-sidebar-border: hsl(var(--sidebar-border));
+  --color-sidebar-ring: hsl(var(--sidebar-ring));
+
+  --font-sans: "Plus Jakarta Sans", sans-serif;
+  --font-serif: "Libre Baskerville", serif;
+  
+  --radius: 0.5rem;
+}
+
+/* Orange & Black Theme - Light Mode Default */
+:root {
+  --background: 30 10% 97%;
+  --foreground: 0 0% 15%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 15%;
+
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 15%;
+
+  --primary: 25 95% 50%;
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 30 10% 91%;
+  --secondary-foreground: 0 0% 20%;
+
+  --muted: 30 10% 95%;
+  --muted-foreground: 0 0% 45%;
+
+  --accent: 30 60% 95%;
+  --accent-foreground: 25 90% 35%;
+
+  --destructive: 0 72% 52%;
+  --destructive-foreground: 0 0% 98%;
+
+  --border: 30 10% 88%;
+  --input: 30 10% 88%;
+  --ring: 25 95% 50%;
+
+  --radius: 0.5rem;
+
+  --chart-1: 25 95% 50%;
+  --chart-2: 35 90% 55%;
+  --chart-3: 15 80% 50%;
+  --chart-4: 45 85% 55%;
+  --chart-5: 0 0% 35%;
+
+  --sidebar: 0 0% 10%;
+  --sidebar-foreground: 0 0% 85%;
+  --sidebar-primary: 25 95% 50%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 0 0% 16%;
+  --sidebar-accent-foreground: 0 0% 100%;
+  --sidebar-border: 0 0% 20%;
+  --sidebar-ring: 25 95% 50%;
+}
+
+.dark {
+  --background: 0 0% 8%;
+  --foreground: 0 0% 90%;
+
+  --card: 0 0% 12%;
+  --card-foreground: 0 0% 90%;
+
+  --popover: 0 0% 12%;
+  --popover-foreground: 0 0% 90%;
+
+  --primary: 25 95% 53%;
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 0 0% 18%;
+  --secondary-foreground: 0 0% 90%;
+
+  --muted: 0 0% 18%;
+  --muted-foreground: 0 0% 60%;
+
+  --accent: 25 50% 15%;
+  --accent-foreground: 25 90% 70%;
+
+  --destructive: 0 62% 30%;
+  --destructive-foreground: 0 0% 98%;
+
+  --border: 0 0% 20%;
+  --input: 0 0% 20%;
+  --ring: 25 95% 53%;
+
+  --chart-1: 25 95% 53%;
+  --chart-2: 35 85% 55%;
+  --chart-3: 15 75% 50%;
+  --chart-4: 45 80% 55%;
+  --chart-5: 0 0% 50%;
+
+  --sidebar: 0 0% 6%;
+  --sidebar-foreground: 0 0% 85%;
+  --sidebar-primary: 25 95% 53%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 0 0% 12%;
+  --sidebar-accent-foreground: 0 0% 90%;
+  --sidebar-border: 0 0% 15%;
+  --sidebar-ring: 25 95% 53%;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+  /* Reserve the brand color for the page-level h1 only.
+     Lower-level headings stay in foreground for a calmer hierarchy. */
+  h1 {
+    @apply font-serif font-bold tracking-tight text-primary;
+  }
+  h2, h3, h4, h5, h6 {
+    @apply font-serif font-bold tracking-tight text-foreground;
+  }
+  /* Subtle separators so cards don't feel like a wall of borders */
+  hr {
+    @apply border-border/60;
+  }
+  /* Tighter focus ring for keyboard nav */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+@layer utilities {
+  .safe-area-inset-top {
+    padding-top: env(safe-area-inset-top);
+  }
+  .safe-area-inset-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .pb-safe {
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+}
+
+@media print {
+  aside, header, nav, .print\\:hidden {
+    display: none !important;
+  }
+  main {
+    margin-left: 0 !important;
+    padding: 0 !important;
+  }
+  .print\\:block {
+    display: block !important;
+  }
+  body {
+    font-size: 11px;
+    padding: 0;
+  }
+  * {
+    break-inside: avoid;
+  }
+}
+```
+
+### client/index.html
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+    
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Retirement Planner" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#e87a14" />
+    
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+
+    <meta property="og:title" content="3-Bucket Retirement Planner" />
+    <meta property="og:description" content="Plan your retirement with confidence using the 3-bucket strategy. Visualize your portfolio, manage withdrawals, and optimize for taxes." />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="/logo.svg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@replit" />
+    <meta name="twitter:title" content="3-Bucket Retirement Planner" />
+    <meta name="twitter:description" content="Plan your retirement with confidence using the 3-bucket strategy." />
+    <meta name="twitter:image" content="/logo.svg" />
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" type="image/png" href="/favicon.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Plus+Jakarta+Sans:ital,wght@0,200..800;1,200..800&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+```
+
+### client/public/manifest.json
+
+```json
+{
+  "name": "3-Bucket Retirement Planner",
+  "short_name": "Retirement Planner",
+  "description": "Plan your retirement with the 3-bucket investment strategy",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f5f4",
+  "theme_color": "#e87a14",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["finance", "productivity"],
+  "screenshots": []
+}
+```
+
+### client/public/logo.svg
+
+```xml
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="3-Bucket Plan">
+  <defs>
+    <linearGradient id="bp-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="hsl(25 95% 58%)"/>
+      <stop offset="100%" stop-color="hsl(25 95% 45%)"/>
+    </linearGradient>
+  </defs>
+  <!-- Bucket 1 (Cash) — top, smallest -->
+  <rect x="22" y="8"  width="20" height="12" rx="3" fill="url(#bp-grad)" opacity="0.55"/>
+  <!-- Bucket 2 (Bridge) — middle -->
+  <rect x="14" y="24" width="36" height="14" rx="3" fill="url(#bp-grad)" opacity="0.78"/>
+  <!-- Bucket 3 (Growth) — base, largest -->
+  <rect x="6"  y="42" width="52" height="16" rx="3" fill="url(#bp-grad)"/>
+</svg>```
+
+### client/public/favicon.svg
+
+```xml
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <rect x="22" y="8"  width="20" height="12" rx="3" fill="#f08a2d" opacity="0.55"/>
+  <rect x="14" y="24" width="36" height="14" rx="3" fill="#ee7a14" opacity="0.78"/>
+  <rect x="6"  y="42" width="52" height="16" rx="3" fill="#d96a08"/>
+</svg>```
+
+### server/index.ts
+
+```ts
+import express, { type Request, Response, NextFunction } from "express";
+import { registerRoutes } from "./routes";
+import { serveStatic } from "./static";
+import { createServer } from "http";
+
+const app = express();
+const httpServer = createServer(app);
+
+declare module "http" {
+  interface IncomingMessage {
+    rawBody: unknown;
+  }
+}
+
+// 12MB cap is enough headroom for the PDF endpoint (8MB decoded after base64 expansion = ~11MB encoded).
+// Anything larger is rejected before parsing.
+app.use(
+  express.json({
+    limit: '12mb',
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
+
+app.use(express.urlencoded({ extended: false, limit: '12mb' }));
+
+export function log(message: string, source = "express") {
+  const formattedTime = new Date().toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path = req.path;
+  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+
+  const originalResJson = res.json;
+  res.json = function (bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path.startsWith("/api")) {
+      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+
+      log(logLine);
+    }
+  });
+
+  next();
+});
+
+(async () => {
+  await registerRoutes(httpServer, app);
+
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+
+    res.status(status).json({ message });
+    throw err;
+  });
+
+  // importantly only setup vite in development and after
+  // setting up all the other routes so the catch-all route
+  // doesn't interfere with the other routes
+  if (process.env.NODE_ENV === "production") {
+    serveStatic(app);
+  } else {
+    const { setupVite } = await import("./vite");
+    await setupVite(httpServer, app);
+  }
+
+  // ALWAYS serve the app on the port specified in the environment variable PORT
+  // Other ports are firewalled. Default to 5000 if not specified.
+  // this serves both the API and the client.
+  // It is the only port that is not firewalled.
+  const port = parseInt(process.env.PORT || "5000", 10);
+  httpServer.listen(
+    {
+      port,
+      host: "0.0.0.0",
+      reusePort: true,
+    },
+    () => {
+      log(`serving on port ${port}`);
+    },
+  );
+})();
+```
+
+### server/routes.ts
+
+```ts
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express
+): Promise<Server> {
+  // Market data proxy endpoint
+  // Uses Yahoo Finance API (free, no key required)
+  // Whitelist tickers to prevent SSRF via path injection.
+  // Allows letters, digits, dot, hyphen — covers ETFs, ADRs, share classes (BRK.B), bond suffixes (ORCL.GP).
+  const TICKER_REGEX = /^[A-Z0-9.\-]{1,10}$/i;
+
+  app.get("/api/quote/:ticker", async (req, res) => {
+    const { ticker } = req.params;
+
+    if (!TICKER_REGEX.test(ticker)) {
+      return res.status(400).json({ error: 'Invalid ticker format' });
+    }
+
+    try {
+      // Using Yahoo Finance v8 API (public, no auth required)
+      const safeTicker = encodeURIComponent(ticker);
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${safeTicker}?interval=1d&range=1d`;
+
+      // Abort after 8s so a slow upstream can't pile up requests.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      if (!response.ok) {
+        return res.status(404).json({ error: 'Ticker not found', ticker });
+      }
+
+      const data = await response.json();
+      const result = data?.chart?.result?.[0];
+
+      if (!result) {
+        return res.status(404).json({ error: 'No data available', ticker });
+      }
+
+      const meta = result.meta;
+      const quote = result.indicators?.quote?.[0];
+
+      // Get current price (last close or current market price)
+      const currentPrice = meta.regularMarketPrice || quote?.close?.[quote.close.length - 1];
+      const previousClose = meta.previousClose;
+
+      // Calculate change percentage
+      const changePercent = previousClose && currentPrice
+        ? ((currentPrice - previousClose) / previousClose) * 100
+        : 0;
+
+      res.json({
+        ticker: ticker.toUpperCase(),
+        price: Number(currentPrice?.toFixed(2)) || 0,
+        name: meta.longName || meta.shortName || ticker.toUpperCase(),
+        changePercent: Number(changePercent.toFixed(2))
+      });
+
+    } catch (error) {
+      // Log details server-side, return generic message to client (don't leak internals).
+      console.error(`Error fetching quote for ${ticker}:`, error);
+      res.status(500).json({ error: 'Failed to fetch market data' });
+    }
+  });
+
+  // PDF parsing endpoint
+  // Hard caps: 8MB decoded (≈11MB base64), 50 pages, 25s total parse time.
+  const MAX_PDF_BYTES = 8 * 1024 * 1024;
+  const MAX_PDF_PAGES = 50;
+  const PDF_PARSE_TIMEOUT_MS = 25_000;
+
+  app.post("/api/parse-pdf", async (req, res) => {
+    try {
+      const { pdfBase64 } = req.body;
+
+      if (!pdfBase64 || typeof pdfBase64 !== 'string') {
+        return res.status(400).json({ error: 'No PDF data provided' });
+      }
+
+      // Reject oversized payloads BEFORE allocating a Buffer.
+      // base64 expands by 4/3, so a decoded cap of 8MB ≈ ~10.7MB encoded.
+      if (pdfBase64.length > Math.ceil(MAX_PDF_BYTES * 4 / 3)) {
+        return res.status(413).json({ error: 'PDF too large (max 8MB)' });
+      }
+
+      const pdfBuffer = Buffer.from(pdfBase64, 'base64');
+      if (pdfBuffer.length > MAX_PDF_BYTES) {
+        return res.status(413).json({ error: 'PDF too large (max 8MB)' });
+      }
+
+      const pdfData = new Uint8Array(pdfBuffer);
+
+      // Race the parse against a hard timeout.
+      const parsePromise = (async () => {
+        const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+        const loadingTask = pdfjsLib.getDocument({ data: pdfData });
+        const pdfDoc = await loadingTask.promise;
+
+        const pageCount = Math.min(pdfDoc.numPages, MAX_PDF_PAGES);
+        let fullText = '';
+        for (let i = 1; i <= pageCount; i++) {
+          const page = await pdfDoc.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map((item: any) => item.str).join(' ');
+          fullText += pageText + '\n';
+        }
+        return fullText;
+      })();
+
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('PDF parse timeout')), PDF_PARSE_TIMEOUT_MS)
+      );
+
+      const fullText = await Promise.race([parsePromise, timeoutPromise]);
+      const holdings = parsePDFText(fullText);
+
+      res.json({ holdings, rawText: fullText, textLength: fullText.length });
+    } catch (error) {
+      console.error('Error parsing PDF:', error);
+      res.status(500).json({ error: 'Failed to parse PDF' });
+    }
+  });
+
+  return httpServer;
+}
+
+function parsePDFText(text: string): Array<{ticker: string, name: string, shares: number, price: number, value: number, bucket: string}> {
+  const holdings: Array<{ticker: string, name: string, shares: number, price: number, value: number, bucket: string}> = [];
+  const seen = new Set<string>();
+  
+  let cleanText = text.replace(/\d+\/\d+\/\d+,\s+\d+:\d+\s+(AM|PM)\s+Empower\s+-\s+Portfolio\s+https?:\/\/[^\s]+\s+\d+\/\d+/gi, ' ');
+  cleanText = cleanText.replace(/Privacy\s+Terms of Service.*?All Rights Reserved\./gi, ' ');
+  
+  // Detect format by checking for header. New format has "1 day $", old has "1 Day %"
+  const newFormatHeader = cleanText.match(/Holding\s+Shares\s+Price\s+Change\s+1\s*day\s+\$/i);
+  const oldFormatHeader = cleanText.match(/Holding\s+Shares\s+Price\s+Change\s+1\s*Day\s*%/i);
+  
+  const headerMatch = newFormatHeader || oldFormatHeader;
+  if (headerMatch && headerMatch.index !== undefined) {
+    cleanText = cleanText.substring(headerMatch.index + headerMatch[0].length);
+  }
+  
+  // Trim at Grand Total
+  const grandTotalIdx = cleanText.search(/Grand\s+Total/i);
+  if (grandTotalIdx !== -1) {
+    cleanText = cleanText.substring(0, grandTotalIdx);
+  }
+
+  const isNewFormat = !!newFormatHeader;
+  
+  const skipTickers = ['NONE', 'FROM', 'ETF', 'SHARES', 'FUND', 'INDEX', 'TRUST', 'DAY', 'HOLDINGS', 'AM', 'HTTPS', 'HTTP', 'TERMS', 'HELP', 'FAQ', 'VI', 'VIT', 'PIMCO', 'BNY', 'MELLON', 'NET', 'WORTH', 'GRAND', 'TOTAL', 'SEARCH'];
+
+  function addHolding(ticker: string, name: string, shares: number, price: number, value: number, bucket: string) {
+    const key = `${ticker}-${shares.toFixed(2)}`;
+    if (!seen.has(key) && shares > 0 && price > 0) {
+      seen.add(key);
+      holdings.push({ ticker, name: name || ticker, shares, price, value: value || shares * price, bucket });
+    }
+  }
+
+  let match;
+
+  if (isNewFormat) {
+    // =========================================================
+    // NEW FORMAT: Holding | Shares | Price | Change | 1 day $ | Value
+    // Row format in extracted text (name is inline after ticker):
+    //   "TICKER  Name of Holding  shares  $price  $change  +$1dayDollar  $value"
+    // =========================================================
+
+    // Fix stray split numbers like "3  ,315" that appear from chart overlays
+    cleanText = cleanText.replace(/(\d)\s+,(\d{3})\b/g, '$1,$2');
+
+    // Pattern N1: PIMCO VIT multi-word ticker (no inline name, just numbers follow)
+    const pimcoNew = /PIMCO\s+VIT\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = pimcoNew.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const price = parseFloat(match[2].replace(/,/g, ''));
+      const value = parseFloat(match[3].replace(/,/g, ''));
+      addHolding('PIMCOVIT', 'PIMCO VIT', shares, price, value, 'bridge');
+    }
+
+    // Pattern N2: Cash row (no inline name)
+    const cashNew = /\bCash\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = cashNew.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const value = parseFloat(match[2].replace(/,/g, ''));
+      addHolding('CASH', 'Cash', shares, 1.00, value, 'cash');
+    }
+
+    // Pattern N3: Insured Bank Deposit row (no inline name)
+    const depositNew = /Insured Bank Deposit\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = depositNew.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const value = parseFloat(match[2].replace(/,/g, ''));
+      addHolding('DEPOSIT', 'Insured Bank Deposit', shares, 1.00, value, 'cash');
+    }
+
+    // Pattern N4: Standard ticker WITH inline name between ticker and numbers
+    // e.g. "VOO  Vanguard S&P 500 ETF  1085  $652.78  $7.92  +$8,593.22  $708,267.67"
+    // e.g. "IBIT  INTERBIT LTD ISIN CA45845F1009...  318  $43.93  $0.00  $0.00  $13,969.74"
+    // The name is any non-newline, non-$ text between ticker and shares.
+    const stdNew = /\b([A-Z]{2,6})\s+(?:[^\n$]*?\s+)?([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/g;
+    while ((match = stdNew.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const value = parseFloat(match[4].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, value, inferBucketFromTicker(ticker));
+    }
+
+  } else {
+    // =========================================================
+    // OLD FORMAT: Holding | Shares | Price | Change | 1 Day % | 1 Day $ | Value
+    // =========================================================
+
+    // Pattern 1a: Standard format WITH total value column
+    // Example: "GCO  Genesco Inc  2431   $27.22   $0.63   +2.37%   +$1,531.53   $66,171.82"
+    const standardWithValue = /\b([A-Z]{2,6}(?:\.[A-Z]{1,2})?)\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/g;
+    while ((match = standardWithValue.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const value = parseFloat(match[4].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, value, inferBucketFromTicker(ticker));
+    }
+
+    // Pattern 1b: Standard format WITHOUT total value column
+    const standardNoValue = /\b([A-Z]{2,6}(?:\.[A-Z]{1,3})?)\b\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,.]+\s+[+-]?[\d,.]+%\s+[+-]?\$[\d,]+/g;
+    while ((match = standardNoValue.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, shares * price, inferBucketFromTicker(ticker));
+    }
+
+    // Pattern 2a: Zero change WITH total value
+    const zeroWithValue = /\b([A-Z]{2,6}(?:\.[A-Z]{1,3})?)\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+\$0\.00\s+0\.00%\s+\$0(?:\.00)?\s+\$([\d,]+\.?\d*)/g;
+    while ((match = zeroWithValue.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const value = parseFloat(match[4].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, value, inferBucketFromTicker(ticker));
+    }
+
+    // Pattern 2b: Zero change WITHOUT total value
+    const zeroNoValue = /\b([A-Z]{2,6}(?:\.[A-Z]{1,3})?)\b\s+[^$]+?\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+\$0\.00\s+0\.00%\s+\$0\b/g;
+    while ((match = zeroNoValue.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      if (skipTickers.includes(ticker) || shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, shares * price, inferBucketFromTicker(ticker));
+    }
+
+    // Pattern 3a: Multi-word proprietary funds WITH total value
+    const proprietaryWithValue = /(INVESCO VI|PIMCO VIT|BNY MELLON)\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = proprietaryWithValue.exec(cleanText)) !== null) {
+      const name = match[1].toUpperCase();
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const value = parseFloat(match[4].replace(/,/g, ''));
+      const ticker = name.replace(/\s+/g, '').substring(0, 6);
+      addHolding(ticker, name, shares, price, value, name.includes('PIMCO') ? 'bridge' : 'growth');
+    }
+
+    // Pattern 3b: Multi-word proprietary funds WITHOUT total value
+    const proprietaryNoValue = /(INVESCO VI|PIMCO VIT|BNY MELLON)\s+([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,]+/gi;
+    while ((match = proprietaryNoValue.exec(cleanText)) !== null) {
+      const name = match[1].toUpperCase();
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      const ticker = name.replace(/\s+/g, '').substring(0, 6);
+      addHolding(ticker, name, shares, price, shares * price, name.includes('PIMCO') ? 'bridge' : 'growth');
+    }
+
+    // Pattern 4a: Cash WITH total value
+    const cashWithValue = /\bCash\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+\s+\$([\d,]+\.?\d*)/gi;
+    while ((match = cashWithValue.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const value = parseFloat(match[2].replace(/,/g, ''));
+      addHolding('CASH', 'Cash', shares, 1.00, value, 'cash');
+    }
+
+    // Pattern 4b: Cash WITHOUT total value
+    const cashNoValue = /\bCash\s+([\d,]+\.?\d*)\s+\$1\.00\s+\$0\.00\s+0\.00%\s+\$0\b/gi;
+    while ((match = cashNoValue.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      addHolding('CASH', 'Cash', shares, 1.00, shares, 'cash');
+    }
+
+    // Pattern 5: Insured Bank Deposit
+    const depositPattern = /Insured Bank Deposit\s+([\d,]+\.?\d*)\s+\$1\.00\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%\s+[+-]?\$[\d,\.]+(?:\s+\$([\d,]+\.?\d*))?/gi;
+    while ((match = depositPattern.exec(cleanText)) !== null) {
+      const shares = parseFloat(match[1].replace(/,/g, ''));
+      const value = match[2] ? parseFloat(match[2].replace(/,/g, '')) : shares;
+      if (shares > 0) addHolding('DEPOSIT', 'Insured Bank Deposit', shares, 1.00, value, 'cash');
+    }
+
+    // Pattern 6: Bond tickers with dot (e.g. ORCL.GP)
+    const bondPattern = /\b([A-Z]{2,6}\.[A-Z]{1,3})\s+(?:[^$\d]*?\s+)?([\d,]+\.?\d*)\s+\$([\d,]+\.?\d*)\s+[+-]?\$[\d,\.]+\s+[+-]?[\d,\.]+%/g;
+    while ((match = bondPattern.exec(cleanText)) !== null) {
+      const ticker = match[1];
+      const shares = parseFloat(match[2].replace(/,/g, ''));
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      if (shares === 0) continue;
+      addHolding(ticker, ticker, shares, price, shares * price, 'bridge');
+    }
+  }
+  
+  return holdings;
+}
+
+function inferBucketFromTicker(ticker: string): string {
+  const t = ticker.toUpperCase();
+  
+  // Money market funds and cash equivalents from major brokerages (Fidelity, Schwab, Vanguard, etc.)
+  const cashFunds = [
+    'SPAXX', 'FDRXX', 'VMFXX', 'SWVXX', 'SPRXX', 'FDLXX', 'FZFXX', 'FGTXX',
+    'FCASH',           // Fidelity Cash Reserves (was misclassified as growth)
+    'SNVXX', 'SNAXX',  // Schwab Government MMF
+    'VUSXX', 'VFFXX',  // Vanguard Treasury / Federal MMF
+    'TTTXX',           // BlackRock Liquidity
+    'MFIS', 'MFRS', 'CASH'
+  ];
+  if (cashFunds.some(c => t.includes(c)) || t === 'CASH' || t.includes('MONEY') || t.includes('DEPOSIT')) return 'cash';
+  
+  const bondFunds = ['BND', 'AGG', 'TIP', 'TIPS', 'VTIP', 'SCHZ', 'IUSB', 'VBTLX', 'BOND', 'GOVT', 'LQD', 'HYG', 'JNK', 'MUB', 'TLT', 'IEF', 'SHY', 'VCIT', 'VCSH', 'BSV', 'BIV', 'BLV', 'VAIPX', 'VBMFX', 'FBNDX', 'VGIT', 'IGIB', 'USHY', 'LBNOX', 'JCBUX', 'VWOB', 'PIMCO'];
+  if (bondFunds.some(b => t.includes(b))) return 'bridge';
+  
+  const bridgeFunds = ['SCHD', 'VIG', 'VYM', 'DVY', 'SDY', 'HDV', 'DGRO', 'NOBL', 'SPYD', 'SPHD', 'VDIGX', 'VHDYX'];
+  if (bridgeFunds.some(i => t.includes(i))) return 'bridge';
+  
+  return 'growth';
+}
+```
+
+---
+
+## After writing all 19 files
+
+**1. Run the tests** in the Shell:
+
+```bash
+npx tsx client/src/lib/engine.test.ts
+npx tsx client/src/lib/montecarlo.test.ts
+```
+
+Expected output:
+- engine.test.ts: `11 passed, 0 failed`
+- montecarlo.test.ts: `18 passed, 0 failed`
+
+**2. Run the TypeScript check** (optional sanity):
+
+```bash
+npx tsc --noEmit
+```
+
+Should be clean. (If you see one error about `vite.config`, that's pre-existing — not from these changes.)
+
+**3. Commit and push** to GitHub using Replit's normal Git workflow (Version Control panel → commit → push).
+
+Commit message: `Rounds 1-3: tax math, security, UI polish, Monte Carlo`
+
+That's it. The live app at retirement-tnywalter.replit.app will auto-redeploy after the push.

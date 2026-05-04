@@ -1,24 +1,32 @@
 import { useMemo } from 'react';
 import { useStore } from '@/lib/store';
 import { runProjection, compareSSClaimingAges } from '@/lib/engine';
+import { runMonteCarlo } from '@/lib/montecarlo';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area, ComposedChart, Line, ReferenceLine } from 'recharts';
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/components/ui/card';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
-import { CalendarClock, TrendingUp } from 'lucide-react';
+import { CalendarClock, TrendingUp, Activity } from 'lucide-react';
 
 export function ProjectionChart() {
-  const { activeScenarioId, scenarios, holdings } = useStore();
+  const { activeScenarioId, scenarios, holdings, accounts } = useStore();
   const scenario = scenarios.find(s => s.id === activeScenarioId);
 
   const data = useMemo(() => {
     if (!scenario) return [];
-    return runProjection(scenario.profile, scenario.bucketConfig, holdings);
-  }, [scenario, holdings]);
+    return runProjection(scenario.profile, scenario.bucketConfig, holdings, { accounts });
+  }, [scenario, holdings, accounts]);
 
   const ssComparison = useMemo(() => {
     if (!scenario) return [];
     return compareSSClaimingAges(scenario.profile, scenario.bucketConfig, holdings);
   }, [scenario, holdings]);
+
+  // Full Monte Carlo: 1000 trials. Seeded so the chart is stable across renders;
+  // remove the seed if you'd rather see fresh stochastic draws on each visit.
+  const monteCarlo = useMemo(() => {
+    if (!scenario || holdings.length === 0) return null;
+    return runMonteCarlo(scenario.profile, scenario.bucketConfig, holdings, accounts, { trials: 1000, seed: 42 });
+  }, [scenario, holdings, accounts]);
 
   if (!scenario || data.length === 0) return <div className="text-muted-foreground text-sm p-4">No data to project</div>;
 
@@ -46,11 +54,110 @@ export function ProjectionChart() {
         <Card className="border-destructive bg-destructive/5" data-testid="card-depletion-warning">
           <CardContent className="p-4">
             <p className="text-sm font-semibold text-destructive">
-              Portfolio depleted at age {depletionYear.age} ({depletionYear.year})
+              Deterministic projection depletes at age {depletionYear.age} ({depletionYear.year}). See the stress test below for the range of outcomes.
             </p>
           </CardContent>
         </Card>
       )}
+
+      <ErrorBoundary fallbackTitle="Stress Test Error">
+        {monteCarlo && (() => {
+          const pct = Math.round(monteCarlo.successRate * 100);
+          const tone = pct >= 85 ? 'primary' : pct >= 70 ? 'amber' : 'destructive';
+          const fanData = monteCarlo.byYear.map(d => ({
+            age: d.age,
+            p5: Math.max(0, d.p5),
+            p25: Math.max(0, d.p25),
+            p50: Math.max(0, d.p50),
+            p75: Math.max(0, d.p75),
+            p95: Math.max(0, d.p95),
+            // For stacked area: p5 is the floor, then differences between bands
+            band5_25: Math.max(0, d.p25 - d.p5),
+            band25_50: Math.max(0, d.p50 - d.p25),
+            band50_75: Math.max(0, d.p75 - d.p50),
+            band75_95: Math.max(0, d.p95 - d.p75),
+          }));
+          const medianDepletion = monteCarlo.depletionAges.length > 0
+            ? Math.round(monteCarlo.depletionAges.slice().sort((a, b) => a - b)[Math.floor(monteCarlo.depletionAges.length / 2)])
+            : null;
+          return (
+            <Card data-testid="card-monte-carlo">
+              <CardHeader>
+                <CardTitle className="font-serif flex items-center gap-2">
+                  <Activity size={18} /> Stress Test (1,000 simulations)
+                </CardTitle>
+                <CardDescription>
+                  Returns sampled from a normal distribution year by year. Bands show the range of portfolio outcomes — darker = more likely.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                  <div className={`p-3 rounded-lg ${
+                    tone === 'primary' ? 'bg-primary/10 border border-primary/30'
+                    : tone === 'amber' ? 'bg-amber-500/10 border border-amber-500/30'
+                    : 'bg-destructive/10 border border-destructive/30'}`}>
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Success Rate</p>
+                    <p className={`text-2xl font-mono font-bold ${
+                      tone === 'primary' ? 'text-primary'
+                      : tone === 'amber' ? 'text-amber-700 dark:text-amber-500'
+                      : 'text-destructive'}`}>{pct}%</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">Survives to age {scenario.profile.lifeExpectancy}</p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-muted/30 border border-border">
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Median Final</p>
+                    <p className="text-2xl font-mono font-bold">${Math.round(monteCarlo.percentiles.p50/1000).toLocaleString()}K</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">50th percentile</p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-muted/30 border border-border">
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Worst Case (5%)</p>
+                    <p className="text-2xl font-mono font-bold">${Math.round(Math.max(0, monteCarlo.percentiles.p5)/1000).toLocaleString()}K</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">5th percentile</p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-muted/30 border border-border">
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Median Depletion</p>
+                    <p className="text-2xl font-mono font-bold">{medianDepletion ? `Age ${medianDepletion}` : 'None'}</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">In {monteCarlo.depletionAges.length} of 1000 trials</p>
+                  </div>
+                </div>
+                <div className="h-[280px] md:h-[360px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={fanData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                      <XAxis dataKey="age" tick={{ fontSize: 11 }} />
+                      <YAxis tickFormatter={(v) => v >= 1000000 ? `${(v/1000000).toFixed(1)}M` : `${Math.round(v/1000)}k`} tick={{ fontSize: 11 }} width={45} />
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                      <Tooltip
+                        formatter={(_value: number, name: string, item: any) => {
+                          // Show actual percentile values on hover, not the band deltas
+                          const d = item?.payload;
+                          if (!d) return ['', name];
+                          const map: Record<string, [string, number]> = {
+                            'Floor (p5)': ['p5', d.p5],
+                            'p5–p25 band': ['p25', d.p25],
+                            'p25–p50 band': ['p50 (median)', d.p50],
+                            'p50–p75 band': ['p75', d.p75],
+                            'p75–p95 band': ['p95', d.p95],
+                          };
+                          const [label, val] = map[name] ?? [name, _value];
+                          return [`$${Math.round(val).toLocaleString()}`, label];
+                        }}
+                        labelFormatter={(age) => `Age ${age}`}
+                      />
+                      <Area type="monotone" dataKey="p5" stackId="fan" stroke="none" fill="transparent" name="Floor (p5)" />
+                      <Area type="monotone" dataKey="band5_25" stackId="fan" stroke="none" fill="hsl(var(--primary))" fillOpacity={0.15} name="p5–p25 band" />
+                      <Area type="monotone" dataKey="band25_50" stackId="fan" stroke="none" fill="hsl(var(--primary))" fillOpacity={0.30} name="p25–p50 band" />
+                      <Area type="monotone" dataKey="band50_75" stackId="fan" stroke="none" fill="hsl(var(--primary))" fillOpacity={0.30} name="p50–p75 band" />
+                      <Area type="monotone" dataKey="band75_95" stackId="fan" stroke="none" fill="hsl(var(--primary))" fillOpacity={0.15} name="p75–p95 band" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+                <p className="text-[11px] text-muted-foreground mt-2 leading-relaxed">
+                  Darker band = middle 50% of outcomes. Lighter wings = the worst and best 25%. The deterministic chart below shows one scenario; this shows the range.
+                </p>
+              </CardContent>
+            </Card>
+          );
+        })()}
+      </ErrorBoundary>
 
       <ErrorBoundary fallbackTitle="Chart Error">
         <Card>

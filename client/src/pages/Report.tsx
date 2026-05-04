@@ -8,13 +8,13 @@ import { calculateRebalancing } from '@/lib/rebalance';
 import { Printer, Download } from 'lucide-react';
 
 export default function ReportPage() {
-  const { activeScenarioId, scenarios, holdings } = useStore();
+  const { activeScenarioId, scenarios, holdings, accounts } = useStore();
   const scenario = scenarios.find(s => s.id === activeScenarioId);
 
   const data = useMemo(() => {
     if (!scenario) return [];
-    return runProjection(scenario.profile, scenario.bucketConfig, holdings);
-  }, [scenario, holdings]);
+    return runProjection(scenario.profile, scenario.bucketConfig, holdings, { accounts });
+  }, [scenario, holdings, accounts]);
 
   const rebalance = useMemo(() => {
     if (!scenario) return null;

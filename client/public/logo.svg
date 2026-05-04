@@ -1,0 +1,14 @@
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="3-Bucket Plan">
+  <defs>
+    <linearGradient id="bp-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="hsl(25 95% 58%)"/>
+      <stop offset="100%" stop-color="hsl(25 95% 45%)"/>
+    </linearGradient>
+  </defs>
+  <!-- Bucket 1 (Cash) — top, smallest -->
+  <rect x="22" y="8"  width="20" height="12" rx="3" fill="url(#bp-grad)" opacity="0.55"/>
+  <!-- Bucket 2 (Bridge) — middle -->
+  <rect x="14" y="24" width="36" height="14" rx="3" fill="url(#bp-grad)" opacity="0.78"/>
+  <!-- Bucket 3 (Growth) — base, largest -->
+  <rect x="6"  y="42" width="52" height="16" rx="3" fill="url(#bp-grad)"/>
+</svg>

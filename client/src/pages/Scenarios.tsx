@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Layout } from '@/components/Layout';
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/components/ui/card';
 import { useStore } from '@/lib/store';
@@ -10,11 +10,24 @@ import { Users, Banknote, CalendarClock, Wallet, FileText, Plus, Copy, Trash2, C
 import { runProjection } from '@/lib/engine';
 import { toast } from 'sonner';
 
+// Bound a numeric input to a sane range. Used everywhere the user types a number.
+const clamp = (n: number, min: number, max: number) =>
+  Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : min;
+
 export default function ScenariosPage() {
-  const { activeScenarioId, scenarios, updateUserProfile, addScenario, duplicateScenario, removeScenario, renameScenario, setActiveScenario, holdings } = useStore();
+  const { activeScenarioId, scenarios, updateUserProfile, addScenario, duplicateScenario, removeScenario, renameScenario, setActiveScenario, holdings, accounts } = useStore();
   const scenario = scenarios.find(s => s.id === activeScenarioId);
   const [editingName, setEditingName] = useState<string | null>(null);
   const [tempName, setTempName] = useState('');
+
+  // Memoize projection per scenario so typing in one card doesn't re-run all of them.
+  const projectionsByScenarioId = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof runProjection>>();
+    for (const s of scenarios) {
+      map.set(s.id, runProjection(s.profile, s.bucketConfig, holdings, { accounts }));
+    }
+    return map;
+  }, [scenarios, holdings]);
 
   if (!scenario) return null;
 
@@ -52,7 +65,7 @@ export default function ScenariosPage() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {scenarios.map(s => {
-              const proj = runProjection(s.profile, s.bucketConfig, holdings);
+              const proj = projectionsByScenarioId.get(s.id) ?? [];
               const finalBal = proj[proj.length - 1]?.totalPortfolio || 0;
               const depletionYear = proj.find(d => d.totalPortfolio <= 0);
               const isActive = s.id === activeScenarioId;
@@ -140,15 +153,15 @@ export default function ScenariosPage() {
                        <div className="grid grid-cols-3 gap-3">
                           <div className="space-y-2">
                               <Label className="text-xs">Current Age</Label>
-                              <Input type="number" value={scenario.profile.currentAge} onChange={(e) => updateUserProfile({ currentAge: Number(e.target.value) })} data-testid="input-current-age" />
+                              <Input type="number" min={18} max={100} value={scenario.profile.currentAge} onChange={(e) => updateUserProfile({ currentAge: clamp(Number(e.target.value), 18, 100) })} data-testid="input-current-age" />
                           </div>
                           <div className="space-y-2">
                               <Label className="text-xs">Retirement Age</Label>
-                              <Input type="number" value={scenario.profile.retirementAge} onChange={(e) => updateUserProfile({ retirementAge: Number(e.target.value) })} data-testid="input-retirement-age" />
+                              <Input type="number" min={18} max={100} value={scenario.profile.retirementAge} onChange={(e) => updateUserProfile({ retirementAge: clamp(Number(e.target.value), 18, 100) })} data-testid="input-retirement-age" />
                           </div>
                           <div className="space-y-2">
                               <Label className="text-xs">Plan To Age</Label>
-                              <Input type="number" value={scenario.profile.lifeExpectancy} onChange={(e) => updateUserProfile({ lifeExpectancy: Number(e.target.value) })} data-testid="input-life-expectancy" />
+                              <Input type="number" min={50} max={120} value={scenario.profile.lifeExpectancy} onChange={(e) => updateUserProfile({ lifeExpectancy: clamp(Number(e.target.value), 50, 120) })} data-testid="input-life-expectancy" />
                           </div>
                       </div>
                   </CardContent>
@@ -168,14 +181,14 @@ export default function ScenariosPage() {
                         </div>
                         <div className="space-y-2">
                             <Label className="text-xs">Current Age</Label>
-                             <Input type="number" value={scenario.profile.spouseAge || ''} placeholder="Optional" onChange={(e) => updateUserProfile({ spouseAge: e.target.value ? Number(e.target.value) : undefined })} data-testid="input-spouse-age" />
+                             <Input type="number" min={18} max={100} value={scenario.profile.spouseAge || ''} placeholder="Optional" onChange={(e) => updateUserProfile({ spouseAge: e.target.value ? clamp(Number(e.target.value), 18, 100) : undefined })} data-testid="input-spouse-age" />
                         </div>
                       </div>
                       <div className="space-y-2">
                           <Label className="text-xs">Spouse Monthly Income</Label>
                           <div className="relative">
                             <span className="absolute left-3 top-2.5 text-muted-foreground text-sm">$</span>
-                            <Input type="number" className="pl-7" value={scenario.profile.spouseIncome || ''} placeholder="0" onChange={(e) => updateUserProfile({ spouseIncome: e.target.value ? Number(e.target.value) : undefined })} data-testid="input-spouse-income" />
+                            <Input type="number" className="pl-7" min={0} max={100000} value={scenario.profile.spouseIncome || ''} placeholder="0" onChange={(e) => updateUserProfile({ spouseIncome: e.target.value ? clamp(Number(e.target.value), 0, 100000) : undefined })} data-testid="input-spouse-income" />
                           </div>
                           <p className="text-[10px] text-muted-foreground">Ongoing income (e.g. $3,333/mo = $40K/year)</p>
                       </div>
@@ -201,12 +214,12 @@ export default function ScenariosPage() {
                              <Label className="text-lg font-semibold text-primary">Monthly Budget</Label>
                              <div className="relative">
                                 <span className="absolute left-3 top-2.5 text-muted-foreground">$</span>
-                                <Input type="number" className="pl-7 text-lg font-mono font-bold" value={scenario.profile.monthlySpending} onChange={(e) => updateUserProfile({ monthlySpending: Number(e.target.value) })} data-testid="input-monthly-spending" />
+                                <Input type="number" className="pl-7 text-lg font-mono font-bold" min={0} max={1000000} value={scenario.profile.monthlySpending} onChange={(e) => updateUserProfile({ monthlySpending: clamp(Number(e.target.value), 0, 1000000) })} data-testid="input-monthly-spending" />
                              </div>
                         </div>
                         <div className="space-y-2">
                              <Label className="text-xs">Inflation Rate %</Label>
-                             <Input type="number" step="0.5" value={scenario.profile.inflationRate} onChange={(e) => updateUserProfile({ inflationRate: Number(e.target.value) })} data-testid="input-inflation-rate" />
+                             <Input type="number" step="0.5" min={-5} max={20} value={scenario.profile.inflationRate} onChange={(e) => updateUserProfile({ inflationRate: clamp(Number(e.target.value), -5, 20) })} data-testid="input-inflation-rate" />
                         </div>
                         <p className="text-xs text-muted-foreground leading-relaxed">
                             Adjusted for inflation annually. At {scenario.bucketConfig.withdrawalRate}% withdrawal rate, ${scenario.profile.monthlySpending.toLocaleString()}/mo needs a ${((scenario.profile.monthlySpending * 12) / (scenario.bucketConfig.withdrawalRate / 100) / 1000000).toFixed(2)}M portfolio.
@@ -228,11 +241,11 @@ export default function ScenariosPage() {
                                 <div className="grid grid-cols-2 gap-3">
                                     <div className="space-y-1.5">
                                         <Label className="text-xs">Claim Age</Label>
-                                        <Input type="number" value={scenario.profile.socialSecurityAge} onChange={(e) => updateUserProfile({ socialSecurityAge: Number(e.target.value) })} data-testid="input-ss-age" />
+                                        <Input type="number" min={62} max={70} value={scenario.profile.socialSecurityAge} onChange={(e) => updateUserProfile({ socialSecurityAge: clamp(Number(e.target.value), 62, 70) })} data-testid="input-ss-age" />
                                     </div>
                                     <div className="space-y-1.5">
                                         <Label className="text-xs">Monthly Amount</Label>
-                                        <Input type="number" value={scenario.profile.socialSecurityAmount} onChange={(e) => updateUserProfile({ socialSecurityAmount: Number(e.target.value) })} data-testid="input-ss-amount" />
+                                        <Input type="number" min={0} max={100000} value={scenario.profile.socialSecurityAmount} onChange={(e) => updateUserProfile({ socialSecurityAmount: clamp(Number(e.target.value), 0, 100000) })} data-testid="input-ss-amount" />
                                     </div>
                                 </div>
                             </div>
@@ -244,11 +257,11 @@ export default function ScenariosPage() {
                                 <div className="grid grid-cols-2 gap-3">
                                     <div className="space-y-1.5">
                                         <Label className="text-xs">Claim Age</Label>
-                                        <Input type="number" placeholder="67" value={scenario.profile.spouseSocialSecurityAge || ''} onChange={(e) => updateUserProfile({ spouseSocialSecurityAge: e.target.value ? Number(e.target.value) : undefined })} data-testid="input-spouse-ss-age" />
+                                        <Input type="number" min={62} max={70} placeholder="67" value={scenario.profile.spouseSocialSecurityAge || ''} onChange={(e) => updateUserProfile({ spouseSocialSecurityAge: e.target.value ? clamp(Number(e.target.value), 62, 70) : undefined })} data-testid="input-spouse-ss-age" />
                                     </div>
                                     <div className="space-y-1.5">
                                         <Label className="text-xs">Monthly Amount</Label>
-                                        <Input type="number" placeholder="0" value={scenario.profile.spouseSocialSecurityAmount || ''} onChange={(e) => updateUserProfile({ spouseSocialSecurityAmount: e.target.value ? Number(e.target.value) : undefined })} data-testid="input-spouse-ss-amount" />
+                                        <Input type="number" min={0} max={100000} placeholder="0" value={scenario.profile.spouseSocialSecurityAmount || ''} onChange={(e) => updateUserProfile({ spouseSocialSecurityAmount: e.target.value ? clamp(Number(e.target.value), 0, 100000) : undefined })} data-testid="input-spouse-ss-amount" />
                                     </div>
                                 </div>
                             </div>
@@ -259,7 +272,7 @@ export default function ScenariosPage() {
                                 </div>
                                 <div className="space-y-2 max-w-[50%]">
                                     <Label className="text-xs">Pension / Annuity (Monthly)</Label>
-                                    <Input type="number" value={scenario.profile.otherIncome} onChange={(e) => updateUserProfile({ otherIncome: Number(e.target.value) })} data-testid="input-other-income" />
+                                    <Input type="number" min={0} max={100000} value={scenario.profile.otherIncome} onChange={(e) => updateUserProfile({ otherIncome: clamp(Number(e.target.value), 0, 100000) })} data-testid="input-other-income" />
                                 </div>
                             </div>
                         </div>
@@ -278,15 +291,15 @@ export default function ScenariosPage() {
               <div className="grid grid-cols-3 gap-4">
                 <div className="space-y-2">
                   <Label className="text-xs">Federal Marginal %</Label>
-                  <Input type="number" step="1" value={scenario.profile.taxConfig?.federalRate ?? 22} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), federalRate: Number(e.target.value) } })} data-testid="input-federal-rate" />
+                  <Input type="number" step="1" min={0} max={50} value={scenario.profile.taxConfig?.federalRate ?? 22} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), federalRate: clamp(Number(e.target.value), 0, 50) } })} data-testid="input-federal-rate" />
                 </div>
                 <div className="space-y-2">
                   <Label className="text-xs">State Rate %</Label>
-                  <Input type="number" step="1" value={scenario.profile.taxConfig?.stateRate ?? 5} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), stateRate: Number(e.target.value) } })} data-testid="input-state-rate" />
+                  <Input type="number" step="1" min={0} max={20} value={scenario.profile.taxConfig?.stateRate ?? 5} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), stateRate: clamp(Number(e.target.value), 0, 20) } })} data-testid="input-state-rate" />
                 </div>
                 <div className="space-y-2">
                   <Label className="text-xs">Capital Gains %</Label>
-                  <Input type="number" step="1" value={scenario.profile.taxConfig?.capitalGainsRate ?? 15} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), capitalGainsRate: Number(e.target.value) } })} data-testid="input-capgains-rate" />
+                  <Input type="number" step="1" min={0} max={30} value={scenario.profile.taxConfig?.capitalGainsRate ?? 15} onChange={(e) => updateUserProfile({ taxConfig: { ...(scenario.profile.taxConfig || { federalRate: 22, stateRate: 5, capitalGainsRate: 15 }), capitalGainsRate: clamp(Number(e.target.value), 0, 30) } })} data-testid="input-capgains-rate" />
                 </div>
               </div>
               <p className="text-[10px] text-muted-foreground mt-3">

@@ -73,7 +73,7 @@
   --accent: 30 60% 95%;
   --accent-foreground: 25 90% 35%;
 
-  --destructive: 0 84% 60%;
+  --destructive: 0 72% 52%;
   --destructive-foreground: 0 0% 98%;
 
   --border: 30 10% 88%;
@@ -154,9 +154,23 @@
     @apply font-sans antialiased bg-background text-foreground;
     padding-top: env(safe-area-inset-top);
     padding-bottom: env(safe-area-inset-bottom);
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   }
-  h1, h2, h3, h4, h5, h6 {
+  /* Reserve the brand color for the page-level h1 only.
+     Lower-level headings stay in foreground for a calmer hierarchy. */
+  h1 {
     @apply font-serif font-bold tracking-tight text-primary;
+  }
+  h2, h3, h4, h5, h6 {
+    @apply font-serif font-bold tracking-tight text-foreground;
+  }
+  /* Subtle separators so cards don't feel like a wall of borders */
+  hr {
+    @apply border-border/60;
+  }
+  /* Tighter focus ring for keyboard nav */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
   }
 }
 

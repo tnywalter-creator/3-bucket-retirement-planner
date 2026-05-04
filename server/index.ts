@@ -12,16 +12,18 @@ declare module "http" {
   }
 }
 
+// 12MB cap is enough headroom for the PDF endpoint (8MB decoded after base64 expansion = ~11MB encoded).
+// Anything larger is rejected before parsing.
 app.use(
   express.json({
-    limit: '50mb',
+    limit: '12mb',
     verify: (req, _res, buf) => {
       req.rawBody = buf;
     },
   }),
 );
 
-app.use(express.urlencoded({ extended: false, limit: '50mb' }));
+app.use(express.urlencoded({ extended: false, limit: '12mb' }));
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
